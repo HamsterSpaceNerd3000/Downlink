@@ -1,0 +1,12 @@
+[08:59:30.227] [Printer] RESOLVE_FEED starting original=rtsp://192.168.1.227/live
+[08:59:30.229] RESOLVE starting original=rtsp://192.168.1.227/live
+[08:59:30.228] [Nerdle] YOUTUBE_ROUTE browser original=https://www.youtube.com/watch
+[08:59:30.229] [Rover 3] YOUTUBE_ROUTE browser original=https://www.youtube.com/watch
+[08:59:30.231] [Rover1] YOUTUBE_ROUTE browser original=https://www.youtube.com/watch
+[08:59:30.260] [Nerdle] YOUTUBE_EMBED video_id=B89oRmywnJo
+[08:59:31.821] [Rover 3] YOUTUBE_EMBED video_id=TyXUaqscyiU
+[08:59:32.118] [Printer] RESOLVE_FEED failed error=NoSupportingHandlers('Unable to handle request: Unsupported url scheme: "rtsp" (requests, urllib)')
+[08:59:32.635] [Rover1] YOUTUBE_EMBED video_id=inCQ49QGmqQ
+[08:59:33.479] YOUTUBE_EMBED attached hwnd=69610
+[08:59:34.263] YOUTUBE_EMBED attached hwnd=69700
+[08:59:35.052] YOUTUBE_EMBED attached hwnd=69736

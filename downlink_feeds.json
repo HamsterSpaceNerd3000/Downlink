@@ -1,0 +1,35 @@
+{
+  "feeds": [
+    {
+      "name": "Nerdle",
+      "url": "https://www.youtube.com/watch?v=B89oRmywnJo",
+      "thumbnail": "https://i.ytimg.com/vi/B89oRmywnJo/maxresdefault.jpg"
+    },
+    {
+      "name": "Rover 3",
+      "url": "https://www.youtube.com/watch?v=TyXUaqscyiU",
+      "thumbnail": "https://i.ytimg.com/vi/TyXUaqscyiU/maxresdefault.jpg"
+    },
+    {
+      "name": "Rover1",
+      "url": "https://www.youtube.com/watch?v=inCQ49QGmqQ",
+      "thumbnail": "https://i.ytimg.com/vi/inCQ49QGmqQ/maxresdefault.jpg"
+    },
+    {
+      "name": "Printer",
+      "url": "rtsp://192.168.1.227/live",
+      "thumbnail": null
+    }
+  ],
+  "playbacks": [
+    {
+      "name": "Playback",
+      "feeds": [
+        "Printer",
+        "Nerdle",
+        "Rover 3",
+        "Rover1"
+      ]
+    }
+  ]
+}
