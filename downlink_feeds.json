@@ -1,9 +1,10 @@
 {
   "feeds": [
     {
-      "name": "Nerdle",
+      "name": "Lab Padre / Avid Space Nerdle",
       "url": "https://www.youtube.com/watch?v=B89oRmywnJo",
-      "thumbnail": "https://i.ytimg.com/vi/B89oRmywnJo/maxresdefault.jpg"
+      "thumbnail": "https://i.ytimg.com/vi/B89oRmywnJo/maxresdefault.jpg",
+      "group": "Feeds"
     },
     {
       "name": "Rover 3",
@@ -11,24 +12,90 @@
       "thumbnail": "https://i.ytimg.com/vi/TyXUaqscyiU/maxresdefault.jpg"
     },
     {
-      "name": "Rover1",
+      "name": "Lab Padre / Avid Space Rover 1",
       "url": "https://www.youtube.com/watch?v=inCQ49QGmqQ",
-      "thumbnail": "https://i.ytimg.com/vi/inCQ49QGmqQ/maxresdefault.jpg"
+      "thumbnail": "https://i.ytimg.com/vi/inCQ49QGmqQ/maxresdefault.jpg",
+      "group": "Feeds"
     },
     {
       "name": "Printer",
       "url": "rtsp://192.168.1.227/live",
       "thumbnail": null
+    },
+    {
+      "name": "NSF Space Coast Live",
+      "url": "https://youtube.com/watch?v=Jm8wRjD3xVA",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/Jm8wRjD3xVA/maxresdefault.jpg"
+    },
+    {
+      "name": "NSF McGregor Live",
+      "url": "https://youtube.com/watch?v=cOmmvhDQ2HM",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/cOmmvhDQ2HM/maxresdefault.jpg"
+    },
+    {
+      "name": "Lab Padre / Avid Space Sentinel",
+      "url": "https://youtube.com/watch?v=IQV0DlS1Ew0",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/IQV0DlS1Ew0/maxresdefault.jpg"
+    },
+    {
+      "name": "Lab Padre / Avid Space Rocket Ranch",
+      "url": "https://youtube.com/watch?v=qw3uaLRrYNY",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/qw3uaLRrYNY/maxresdefault.jpg"
+    },
+    {
+      "name": "Rover 2",
+      "url": "https://youtube.com/watch?v=tS2PHJmvJzo",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/tS2PHJmvJzo/maxresdefault.jpg"
+    },
+    {
+      "name": "Launch VLC LInk",
+      "url": "https://prod-fastly-us-west-1.video.pscp.tv/Transcoding/v1/hls/gpi6l942c3zIPGRpHg5NQjH6IPbgS-PXt6eCErar3hFpMFR--6U9iuLRgSKZnBWqedvONnABC5oEMRpoyhRR7g/non_transcode/us-west-1/periscope-replay-direct-prod-us-west-1-public/master_dynamic_lowlatency.m3u8?type=live.",
+      "group": "Feeds",
+      "thumbnail": null
+    },
+    {
+      "name": "Lab Cam",
+      "url": "https://youtube.com/watch?v=1_XLpEKtW8Y",
+      "group": "Extra",
+      "thumbnail": "https://i.ytimg.com/vi/1_XLpEKtW8Y/maxresdefault.jpg"
+    },
+    {
+      "name": "Sapphire",
+      "url": "https://youtube.com/watch?v=Dr3g-1r9BbI",
+      "group": "Extra",
+      "thumbnail": "https://i.ytimg.com/vi/Dr3g-1r9BbI/maxresdefault.jpg"
+    },
+    {
+      "name": "NSF Starbase Live",
+      "url": "https://youtube.com/watch?v=mhJRzQsLZGg",
+      "group": "Feeds",
+      "thumbnail": "https://i.ytimg.com/vi/mhJRzQsLZGg/maxresdefault.jpg"
+    },
+    {
+      "name": "Test",
+      "url": "https://www.twitch.tv/teamliquid",
+      "group": "Feeds",
+      "thumbnail": "https://static-cdn.jtvnw.net/previews-ttv/live_user_teamliquid-0x0.jpg"
     }
   ],
   "playbacks": [
     {
-      "name": "Playback",
+      "name": "Test",
       "feeds": [
-        "Printer",
-        "Nerdle",
-        "Rover 3",
-        "Rover1"
+        "NSF Starbase Live",
+        "NSF Space Coast Live",
+        "NSF McGregor Live",
+        "Lab Padre / Avid Space Sentinel",
+        "Lab Padre / Avid Space Rover 1",
+        "Lab Padre / Avid Space Rocket Ranch",
+        "Lab Padre / Avid Space Nerdle",
+        "Test",
+        null
       ]
     }
   ]

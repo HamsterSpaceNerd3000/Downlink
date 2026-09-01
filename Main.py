@@ -1,194 +1,26 @@
-"""Downlink: a hub for saved feeds and multi-stream VLC windows."""
-
+﻿"""Downlink: a hub for saved feeds and multi-stream VLC windows."""
 import json
-import ctypes
-import html
-import http.server
+import math
 import multiprocessing
-import os
 import platform
-import re
+import queue
 import threading
 import time
-import uuid
 from io import BytesIO
-from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 
 import customtkinter as ctk
 import vlc
-import webview
 
-DIRECT_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".m3u8"}
-FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downlink_feeds.json")
-DEBUG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downlink_log.log")
-DEBUG_LOCK = threading.Lock()
+from app_support import FEEDS_FILE, debug_log
+from streaming import is_youtube_url, redact_url, resolve_stream, youtube_video_id
+from youtube_player import YouTubeBrowser
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-
-def redact_url(url: str) -> str:
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return "<direct-url>"
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-
-
-def debug_log(message: str):
-    timestamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
-    line = f"[{timestamp}] {message}\n"
-    try:
-        with DEBUG_LOCK:
-            with open(DEBUG_FILE, "a", encoding="utf-8") as file:
-                file.write(line)
-    except OSError:
-        pass
-
-
-def looks_like_direct_media(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return any(path.endswith(ext) for ext in DIRECT_EXTENSIONS)
-
-
-def youtube_video_id(url: str) -> str | None:
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().split(":", 1)[0]
-    if host == "youtu.be":
-        return parsed.path.strip("/").split("/")[0] or None
-    if host.endswith("youtube.com"):
-        if parsed.path == "/watch":
-            return parsed.query.split("v=", 1)[1].split("&", 1)[0] if "v=" in parsed.query else None
-        match = re.match(r"^/(?:live|embed|shorts)/([^/?]+)", parsed.path)
-        return match.group(1) if match else None
-    return None
-
-
-def is_youtube_url(url: str) -> bool:
-    return youtube_video_id(url) is not None
-
-
-def run_youtube_webview(video_id: str, title: str):
-    """Run one YouTube WebView on the child process's required main thread."""
-    class WrapperHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            safe_id = html.escape(video_id, quote=True)
-            safe_origin = html.escape(origin, quote=True)
-            page = f"""<!doctype html>
-<html><head><meta name="referrer" content="origin">
-<style>html,body,iframe{{width:100%;height:100%;margin:0;border:0;background:#000;overflow:hidden}}</style>
-</head><body><iframe
-src="https://www.youtube.com/embed/{safe_id}?autoplay=1&amp;mute=1&amp;playsinline=1&amp;rel=0&amp;enablejsapi=1&amp;origin={safe_origin}"
-allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="origin"></iframe>
-</body></html>""".encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(page)))
-            self.end_headers()
-            self.wfile.write(page)
-
-        def log_message(self, _format, *_args):
-            return
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), WrapperHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    webview.create_window(title, f"http://127.0.0.1:{server.server_address[1]}/", width=960, height=600)
-    webview.start(gui="edgechromium")
-    server.shutdown()
-
-
-class YouTubePlayerWindow:
-    """Open an official YouTube iframe in a dedicated WebView2 process."""
-
-    @classmethod
-    def open(cls, url: str, title: str, host=None):
-        video_id = youtube_video_id(url)
-        if not video_id:
-            raise ValueError("That is not a supported YouTube URL.")
-        window_title = f"Downlink YouTube {uuid.uuid4().hex}"
-        debug_log(f"[{title}] YOUTUBE_EMBED video_id={video_id}")
-        process = multiprocessing.Process(target=run_youtube_webview, args=(video_id, window_title), daemon=True)
-        process.start()
-        if host is not None and platform.system() == "Windows":
-            cls._attach_to_tk(process, window_title, host)
-        return process
-
-    @classmethod
-    def _attach_to_tk(cls, process, window_title, host, attempts=0):
-        if not host.winfo_exists() or not process.is_alive():
-            return
-        hwnd = ctypes.windll.user32.FindWindowW(None, window_title)
-        if hwnd:
-            parent = host.winfo_id()
-            user32 = ctypes.windll.user32
-            style = user32.GetWindowLongW(hwnd, -16)
-            # WS_CHILD plus no caption/menu/frame prevents a second-looking window.
-            chrome = 0x80000000 | 0x00C00000 | 0x00080000 | 0x00040000 | 0x00020000 | 0x00010000 | 0x00000080
-            user32.SetWindowLongW(hwnd, -16, (style | 0x40000000) & ~chrome)
-            user32.SetParent(hwnd, parent)
-            cls._resize_embedded(hwnd, host)
-            host.bind("<Configure>", lambda _event: cls._resize_embedded(hwnd, host), add="+")
-            debug_log(f"YOUTUBE_EMBED attached hwnd={hwnd}")
-            return
-        if attempts < 40:
-            host.after(250, lambda: cls._attach_to_tk(process, window_title, host, attempts + 1))
-
-    @staticmethod
-    def _resize_embedded(hwnd, host):
-        if host.winfo_exists():
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, 0, 0, 0, max(1, host.winfo_width()), max(1, host.winfo_height()), 0x0010 | 0x0040 | 0x0020
-            )
-
-
-class YouTubePane(ctk.CTkFrame):
-    """A lightweight tile representing a YouTube feed opened in WebView2."""
-
-    def __init__(self, master, title, original_url):
-        super().__init__(master, fg_color="#080808", corner_radius=6)
-        self.original_url = original_url
-        self.title = title
-        self.process = None
-        self.video_frame = tk.Frame(self, bg="black")
-        self.video_frame.pack(fill="both", expand=True, padx=2, pady=2)
-        self.process = YouTubePlayerWindow.open(original_url, title, self.video_frame)
-
-    def stop(self):
-        if self.process and self.process.is_alive():
-            self.process.terminate()
-        self.destroy()
-
-
-def resolve_stream(url: str) -> tuple[str, str | None, dict]:
-    """Return a VLC-ready URL, thumbnail URL, and required HTTP headers."""
-    debug_log(f"RESOLVE starting original={redact_url(url)}")
-    if looks_like_direct_media(url):
-        return url, None, {}
-    try:
-        import yt_dlp
-    except ImportError as exc:
-        raise RuntimeError("This link needs yt-dlp. Install it with: pip install yt-dlp") from exc
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best[ext=m3u8]/best[protocol^=m3u8]/best[vcodec!=none][acodec!=none]/best",
-        "noplaylist": True,
-        "live_from_start": False,  # Prevents grabbing dead live-stream buffer segments
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if "url" in info:
-            debug_log(f"RESOLVE success original={redact_url(url)} direct={redact_url(info['url'])} protocol={info.get('protocol', 'unknown')}")
-            return info["url"], info.get("thumbnail"), info.get("http_headers", {})
-        for fmt in reversed(info.get("formats", [])):
-            if fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
-                debug_log(f"RESOLVE success original={redact_url(url)} direct={redact_url(fmt['url'])} protocol={fmt.get('protocol', 'unknown')}")
-                return fmt["url"], info.get("thumbnail"), fmt.get("http_headers", info.get("http_headers", {}))
-    raise RuntimeError("Could not extract a playable stream from that link.")
 
 
 class StreamPane(ctk.CTkFrame):
@@ -203,6 +35,7 @@ class StreamPane(ctk.CTkFrame):
         self._stopped = False
         self._dragging = False
         self._is_reconnecting = False
+        self._hide_toolbar_id = None
 
         self.video_frame = tk.Frame(self, bg="black")
         self.video_frame.pack(fill="both", expand=True, padx=2, pady=(2, 0))
@@ -211,20 +44,28 @@ class StreamPane(ctk.CTkFrame):
         controls.pack(fill="x", padx=2, pady=2)
 
         ctk.CTkLabel(controls, text=title, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
-        self.play_pause_btn = ctk.CTkButton(controls, text="⏸", width=34, height=26, command=self.toggle_play)
+        self.play_pause_btn = ctk.CTkButton(controls, text="â¸", width=34, height=26, command=self.toggle_play)
         self.play_pause_btn.pack(side="left", padx=(2, 4), pady=4)
-        ctk.CTkButton(controls, text="⏹", width=34, height=26, command=self.stop).pack(side="left", padx=2, pady=4)
+        ctk.CTkButton(controls, text="â¹", width=34, height=26, command=self.stop).pack(side="left", padx=2, pady=4)
 
         self.time_slider = ctk.CTkSlider(controls, from_=0, to=1000, command=lambda _value: None)
         self.time_slider.pack(side="left", fill="x", expand=True, padx=4, pady=4)
 
+        self.hover_toolbar = ctk.CTkFrame(
+            self, fg_color="#252a31", corner_radius=4, border_width=1, border_color="#4a525e"
+        )
+        ctk.CTkButton(
+            self.hover_toolbar, text="Test", width=58, height=26,
+            command=self._test_option
+        ).pack(padx=5, pady=5)
+        self._bind_hover_events(self)
+
         vlc_args = [
             "--no-xlib",
             "--avcodec-hw=none",
-            "--network-caching=3000",
-            "--live-caching=3000",
-            "--clock-jitter=0",
-            "--clock-synchro=0",
+            "--vout=direct3d11",
+            "--network-caching=500",
+            "--live-caching=500",
         ]
         user_agent = self.headers.get("User-Agent") or self.headers.get("user-agent")
         if user_agent:
@@ -250,6 +91,38 @@ class StreamPane(ctk.CTkFrame):
         self.after(100, self._embed_video)
         self._update_loop()
 
+    def _bind_hover_events(self, widget):
+        widget.bind("<Enter>", self._show_hover_toolbar, add="+")
+        widget.bind("<Leave>", self._schedule_hide_hover_toolbar, add="+")
+        for child in widget.winfo_children():
+            if child is not self.hover_toolbar:
+                self._bind_hover_events(child)
+        self.hover_toolbar.bind("<Enter>", self._show_hover_toolbar, add="+")
+        self.hover_toolbar.bind("<Leave>", self._schedule_hide_hover_toolbar, add="+")
+
+    def _show_hover_toolbar(self, _event=None):
+        if self._hide_toolbar_id is not None:
+            self.after_cancel(self._hide_toolbar_id)
+            self._hide_toolbar_id = None
+        self.hover_toolbar.place(relx=0.5, y=10, anchor="n")
+
+    def _schedule_hide_hover_toolbar(self, _event=None):
+        if self._hide_toolbar_id is None:
+            self._hide_toolbar_id = self.after(100, self._hide_hover_toolbar)
+
+    def _hide_hover_toolbar(self):
+        self._hide_toolbar_id = None
+        pointer_x, pointer_y = self.winfo_pointerxy()
+        inside_pane = (
+            self.winfo_rootx() <= pointer_x < self.winfo_rootx() + self.winfo_width()
+            and self.winfo_rooty() <= pointer_y < self.winfo_rooty() + self.winfo_height()
+        )
+        if not inside_pane:
+            self.hover_toolbar.place_forget()
+
+    def _test_option(self):
+        debug_log(f"[{self.stream_title}] HOVER_TOOLBAR_TEST")
+
     def _set_media(self, stream_url: str, headers: dict):
         """Creates and configures a new media object with stream options."""
         previous_url = getattr(self, "current_stream_url", None)
@@ -263,9 +136,11 @@ class StreamPane(ctk.CTkFrame):
 
         media = self.instance.media_new(stream_url)
         
-        # Stream buffering and reconnect options
-        media.add_option(":network-caching=3000")
-        media.add_option(":live-caching=3000")
+        # Stream buffering and transport options
+        media.add_option(":network-caching=500")
+        media.add_option(":live-caching=500")
+        if stream_url.lower().startswith("rtsp://"):
+            media.add_option(":rtsp-tcp")
         media.add_option(":http-forward-cookies=true")
         media.add_option(":avcodec-skiploopfilter=4")
 
@@ -314,10 +189,10 @@ class StreamPane(ctk.CTkFrame):
     def toggle_play(self):
         if self.player.is_playing():
             self.player.pause()
-            self.play_pause_btn.configure(text="▶")
+            self.play_pause_btn.configure(text="â–¶")
         else:
             self.player.play()
-            self.play_pause_btn.configure(text="⏸")
+            self.play_pause_btn.configure(text="â¸")
 
     def _on_slider_release(self, _event):
         length = self.player.get_length()
@@ -340,10 +215,11 @@ class StreamPane(ctk.CTkFrame):
             elif self._last_logged_position is None or abs(position - self._last_logged_position) >= 1000:
                 debug_log(f"[{self.stream_title}] PROGRESS state={state_name} position={position / 1000:.1f}s advancing={position != self._last_logged_position}")
             self._last_logged_position = position
+            is_rtsp = self.current_stream_url.lower().startswith("rtsp://")
 
             if state in (vlc.State.Ended, vlc.State.Error):
                 self._start_reconnect(f"VLC_{state_name.upper()}")
-            elif state == vlc.State.Buffering:
+            elif state == vlc.State.Buffering and not is_rtsp:
                 if self._buffering_since is None:
                     self._buffering_since = now
                 elif now - self._buffering_since > 5:
@@ -351,11 +227,12 @@ class StreamPane(ctk.CTkFrame):
                     self._start_reconnect("BUFFER_TIMEOUT")
             else:
                 self._buffering_since = None
-                if self._last_position is None or position > self._last_position:
-                    self._last_progress_at = now
-                elif state == vlc.State.Playing and now - self._last_progress_at > 5:
-                    debug_log(f"[{self.stream_title}] PLAYBACK_STALL duration={now - self._last_progress_at:.1f}s")
-                    self._start_reconnect("POSITION_TIMEOUT")
+                if not is_rtsp:
+                    if self._last_position is None or position > self._last_position:
+                        self._last_progress_at = now
+                    elif state == vlc.State.Playing and now - self._last_progress_at > 5:
+                        debug_log(f"[{self.stream_title}] PLAYBACK_STALL duration={now - self._last_progress_at:.1f}s")
+                        self._start_reconnect("POSITION_TIMEOUT")
                 self._last_position = position
 
             if not self._dragging and not self._is_reconnecting:
@@ -389,7 +266,9 @@ class StreamPane(ctk.CTkFrame):
         if self._stopped or not self.winfo_exists():
             return
         position = self.player.get_time()
-        if self.player.get_state() == vlc.State.Playing and position > self._recovery_position:
+        is_rtsp = self.current_stream_url.lower().startswith("rtsp://")
+        position_changed = position != self._recovery_position
+        if self.player.get_state() == vlc.State.Playing and (is_rtsp or position_changed):
             self._last_position = position
             self._last_progress_at = time.monotonic()
             self._is_reconnecting = False
@@ -440,327 +319,669 @@ class StreamPane(ctk.CTkFrame):
 
 
 class PlayerWindow(ctk.CTkToplevel):
-    """A resizable window containing any number of stream panes."""
+    """A resizable window containing any number of stream/placeholder panes."""
 
     def __init__(self, master, title="Downlink Window", instance=None):
         super().__init__(master)
         self.title(title)
-        self.geometry("1100x700")
-        self.minsize(560, 360)
+        self.geometry("380x280")
+        self.minsize(380, 280)
         self.vlc_instance = instance or master.vlc_instance
         self.panes = []
+        self._open_generation = 0
         self.grid_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        self.grid_frame.grid_columnconfigure((0, 1), weight=1)
+        self.grid_frame.pack(fill="both", expand=True, padx=0, pady=0)
         self.bind("<FocusIn>", lambda _event: master.set_active_window(self))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def add_stream(self, stream_url, title, headers=None, original_url=""):
-        if is_youtube_url(original_url):
-            pane = YouTubePane(self.grid_frame, title, original_url)
-        else:
-            pane = StreamPane(self.grid_frame, stream_url, title, headers, original_url, self.vlc_instance)
+        pane = StreamPane(self.grid_frame, stream_url, title, headers, original_url, self.vlc_instance)
         self.panes.append(pane)
-        columns = 2 if len(self.panes) > 1 else 1
+        self._configure_layout()
+
+    def add_placeholder(self, box_number):
+        pane = PlaceholderPane(self.grid_frame, self.title(), box_number)
+        self.panes.append(pane)
+        self._configure_layout()
+
+    def add_youtube_feed(self, feed, generation=None):
+        if generation is not None and getattr(self, "_open_generation", None) != generation:
+            return
+        # Single-feed YouTubeBrowser instance per grid slot
+        yt_pane = YouTubeBrowser(self.grid_frame, [feed], self.title())
+        self.panes.append(yt_pane)
+        self._configure_layout()
+
+    def _configure_layout(self):
+        self.grid_frame.update_idletasks()
+        pane_count = len(self.panes)
+        if pane_count == 0:
+            return
+
+        columns, rows = self._grid_dimensions(pane_count)
+
+        # Forget old placements
+        for item in self.panes:
+            item.place_forget()
+
+        cell_width = 1.0 / columns
+        cell_height = 1.0 / rows
+
         for index, item in enumerate(self.panes):
-            item.grid(row=index // columns, column=index % columns, sticky="nsew", padx=5, pady=5)
-        for row in range((len(self.panes) + columns - 1) // columns):
-            self.grid_frame.grid_rowconfigure(row, weight=1)
+            row = index // columns
+            col = index % columns
+
+            item.place(
+                relx=col * cell_width,
+                rely=row * cell_height,
+                relwidth=cell_width,
+                relheight=cell_height,
+            )
+
+        self.resize_for_count(pane_count)
+
+    def _grid_dimensions(self, pane_count):
+        if pane_count <= 1:
+            return 1, 1
+        if pane_count <= 3:
+            return pane_count, 1
+        if pane_count == 4:
+            return 2, 2
+        columns = 3
+        return columns, math.ceil(pane_count / columns)
+
+    def resize_for_count(self, pane_count):
+        columns, rows = self._grid_dimensions(pane_count)
+        window_width = columns * 360
+        window_height = rows * 260
+        self.geometry(f"{window_width}x{window_height}")
 
     def _on_close(self):
+        self._open_generation += 1
         for pane in self.panes:
-            pane.stop()
+            if hasattr(pane, "stop"):
+                pane.stop()
         self.destroy()
 
+class FeedSidebarTile(ctk.CTkFrame):
+    """Compact saved-feed card used by the Hub sidebar."""
 
-class FeedTile(ctk.CTkFrame):
-    """Saved feed tile with a thumbnail placeholder, name, and quantity controls."""
-
-    def __init__(self, master, feed, on_add, on_delete, on_drag):
-        super().__init__(master, width=190, height=190, fg_color="#1b1b1b", corner_radius=8)
+    def __init__(self, master, feed, app):
+        super().__init__(master, fg_color="#24272d", corner_radius=5, height=96)
         self.feed = feed
-        self.on_add = on_add
-        self.on_delete = on_delete
-        self.on_drag = on_drag
+        self.app = app
         self.pack_propagate(False)
-        self.thumbnail = ctk.CTkLabel(self, text="VIDEO", height=105, fg_color="#292929", corner_radius=5)
-        self.thumbnail.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(self, text=feed["name"], anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", padx=10)
-        controls = ctk.CTkFrame(self, fg_color="transparent")
-        controls.pack(fill="x", padx=8, pady=6)
-        ctk.CTkButton(controls, text="-", width=28, height=25, command=self.decrease).pack(side="left")
-        self.quantity_label = ctk.CTkLabel(controls, text="1", width=25)
-        self.quantity_label.pack(side="left")
-        ctk.CTkButton(controls, text="+", width=28, height=25, command=self.increase).pack(side="left")
-        ctk.CTkButton(controls, text="Add", width=55, height=25, command=lambda: on_add(self)).pack(side="right")
-        ctk.CTkButton(self, text="Remove", width=65, height=22, fg_color="transparent", command=lambda: on_delete(self)).pack(pady=(0, 4))
-        for widget in (self, self.thumbnail):
-            widget.bind("<ButtonPress-1>", self._start_drag)
-            widget.bind("<B1-Motion>", self._drag)
 
-    def increase(self):
-        self.feed["quantity"] += 1
-        self.quantity_label.configure(text=str(self.feed["quantity"]))
+        self.thumbnail = ctk.CTkLabel(
+            self, text="", width=72, height=78, fg_color="#15171a", corner_radius=3
+        )
+        self.thumbnail.pack(side="left", padx=(5, 7), pady=5)
 
-    def decrease(self):
-        self.feed["quantity"] = max(1, self.feed["quantity"] - 1)
-        self.quantity_label.configure(text=str(self.feed["quantity"]))
+        info = ctk.CTkFrame(self, fg_color="transparent")
+        info.pack(side="left", fill="both", expand=True, pady=7)
+        ctk.CTkLabel(
+            info,
+            text=feed.get("name", "Unnamed feed"),
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(fill="x", padx=(0, 3), pady=(3, 0))
+        ctk.CTkLabel(
+            info,
+            text="Drag to an output",
+            anchor="w",
+            text_color="#7f8792",
+            font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=(0, 3), pady=(2, 0))
 
-    def _start_drag(self, event):
-        self._drag_start = (event.x_root, event.y_root)
+        self._menu_button = ctk.CTkButton(
+            self, text="â‹®", width=24, height=26, fg_color="transparent",
+            hover_color="#343942", command=self.show_menu
+        )
+        self._menu_button.place(relx=1.0, x=-4, y=4, anchor="ne")
 
-    def _drag(self, event):
-        self.on_drag(self, event.x_root - self._drag_start[0], event.y_root - self._drag_start[1])
+        self._bind_drag_events(self)
 
+    def _bind_drag_events(self, widget):
+        widget.bind("<ButtonPress-1>", self._press, add="+")
+        widget.bind("<B1-Motion>", self._motion, add="+")
+        widget.bind("<ButtonRelease-1>", self._release, add="+")
+        widget.bind("<Button-3>", self.show_menu, add="+")
+        for child in widget.winfo_children():
+            if child is not getattr(self, "_menu_button", None):
+                self._bind_drag_events(child)
 
-class MainWindow(ctk.CTk):
-    """Hub for saved feeds and playback windows."""
+    def _press(self, event):
+        self.app.begin_feed_drag(self.feed, event.x_root, event.y_root)
 
-    def __init__(self):
-        super().__init__()
-        self.title("Downlink Hub")
-        self.geometry("900x650")
-        self.minsize(700, 500)
-        self.feeds = self._load_feeds()
-        self.windows = []
-        self.active_window = None
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=24, pady=(20, 8))
-        ctk.CTkLabel(header, text="Downlink Hub", font=ctk.CTkFont(size=26, weight="bold")).pack(side="left")
-        ctk.CTkButton(header, text="+ New window", width=125, command=self.new_window).pack(side="right")
-        ctk.CTkButton(header, text="+ Add feed", width=105, command=self.add_feed_dialog).pack(side="right", padx=8)
-        ctk.CTkLabel(self, text="Save feeds here, then place one or more into any playback window.", text_color="#999999").pack(anchor="w", padx=26, pady=(0, 15))
-        self.feed_area = ctk.CTkScrollableFrame(self, label_text="Saved feeds")
-        self.feed_area.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-        self.status_label = ctk.CTkLabel(self, text="", text_color="#999999")
-        self.status_label.pack(pady=(0, 8))
-        self._render_feeds()
-
-    def _load_feeds(self):
-        try:
-            with open(FEEDS_FILE, "r", encoding="utf-8") as file:
-                feeds = json.load(file)
-            return [{"name": item["name"], "url": item["url"], "thumbnail": item.get("thumbnail"), "quantity": 1} for item in feeds]
-        except (OSError, ValueError, KeyError, TypeError):
-            return []
-
-    def _save_feeds(self):
-        with open(FEEDS_FILE, "w", encoding="utf-8") as file:
-            json.dump([{"name": f["name"], "url": f["url"], "thumbnail": f.get("thumbnail")} for f in self.feeds], file, indent=2)
-
-    def _render_feeds(self):
-        for child in self.feed_area.winfo_children():
-            child.destroy()
-        for index, feed in enumerate(self.feeds):
-            tile = FeedTile(self.feed_area, feed, self.add_to_window, self.delete_feed, self.drag_tile)
-            tile.grid(row=index // 4, column=index % 4, padx=8, pady=8, sticky="n")
-            self._load_thumbnail(tile, feed)
-
-    def _load_thumbnail(self, tile, feed):
-        thumbnail_url = feed.get("thumbnail")
-        if not thumbnail_url:
-            return
-
-        def fetch():
-            try:
-                from PIL import Image
-                image = Image.open(BytesIO(urlopen(thumbnail_url, timeout=8).read()))
-                image.thumbnail((174, 100))
-                self.after(0, lambda: self._set_thumbnail(tile, image))
-            except Exception:
-                pass
-
-        threading.Thread(target=fetch, daemon=True).start()
-
-    def _set_thumbnail(self, tile, image):
-        if tile.winfo_exists():
-            tile.thumbnail_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
-            tile.thumbnail.configure(image=tile.thumbnail_image, text="")
-
-    def add_feed_dialog(self):
-        url = simpledialog.askstring("Add feed", "Stream URL:", parent=self)
-        if not url or not url.strip():
-            return
-        name = simpledialog.askstring("Name feed", "Display name:", initialvalue=urlparse(url).netloc or "New feed", parent=self)
-        if not name:
-            return
-        self.feeds.append({"name": name.strip(), "url": url.strip(), "quantity": 1})
-        self._save_feeds()
-        self._render_feeds()
-
-    def delete_feed(self, tile):
-        self.feeds.remove(tile.feed)
-        self._save_feeds()
-        self._render_feeds()
-
-    def drag_tile(self, tile, dx, _dy):
-        current = self.feeds.index(tile.feed)
-        target = max(0, min(len(self.feeds) - 1, current + (1 if dx > 80 else -1 if dx < -80 else 0)))
-        if target != current:
-            self.feeds.insert(target, self.feeds.pop(current))
-            self._save_feeds()
-            self._render_feeds()
-
-    def new_window(self):
-        window = PlayerWindow(self, title=f"Downlink Window {len(self.windows) + 1}", instance=self.vlc_instance)
-        self.windows.append(window)
-        self.active_window = window
-
-    def set_active_window(self, window):
-        if window.winfo_exists():
-            self.active_window = window
-
-    def add_to_window(self, tile):
-        if self.active_window is None or not self.active_window.winfo_exists():
-            self.new_window()
-        window = self.active_window
-        self.status_label.configure(text=f"Resolving {tile.feed['name']}...", text_color="#e0a030")
-        threading.Thread(target=self._resolve_and_add, args=(tile.feed, window), daemon=True).start()
-
-    def resolve_and_add(self, feed, window):
-        try:
-            if is_youtube_url(feed["url"]):
-                debug_log(f"[{feed['name']}] YOUTUBE_ROUTE browser original={redact_url(feed['url'])}")
-                self.after(0, lambda: window.add_stream(
-                    "", feed["name"], original_url=feed["url"]
-                ))
-                return
-            debug_log(f"[{feed['name']}] RESOLVE_FEED starting original={redact_url(feed['url'])}")
-            stream_url, thumbnail, headers = resolve_stream(feed["url"])
-            if thumbnail and feed.get("thumbnail") != thumbnail:
-                feed["thumbnail"] = thumbnail
-                self.after(0, self.save_data)
-            # Make sure headers=headers is passed here:
-            self.after(0, lambda: window.add_stream(stream_url, feed["name"], headers=headers))
-        except Exception as exc:
-            debug_log(f"[{feed['name']}] RESOLVE_FEED failed error={exc!r}")
-            error_message = str(exc)
-            self.after(0, lambda error_message=error_message: messagebox.showerror(
-                "Couldn't play that link", error_message, parent=self
-            ))
-
-    def _show_error(self, message):
-        self.status_label.configure(text="")
-        messagebox.showerror("Couldn't play that link", message)
-
-
-class ThemedForm(ctk.CTkToplevel):
-    def __init__(self, master, title, fields, on_submit):
-        super().__init__(master)
-        self.title(title)
-        self.geometry("420x220")
-        self.resizable(False, False)
-        self.transient(master)
-        self.grab_set()
-        self.on_submit = on_submit
-        self.entries = {}
-        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", padx=24, pady=(20, 12))
-        for key, label, value in fields:
-            row = ctk.CTkFrame(self, fg_color="transparent")
-            row.pack(fill="x", padx=24, pady=4)
-            ctk.CTkLabel(row, text=label, width=90, anchor="w").pack(side="left")
-            entry = ctk.CTkEntry(row)
-            entry.insert(0, value)
-            entry.pack(side="left", fill="x", expand=True)
-            self.entries[key] = entry
-        actions = ctk.CTkFrame(self, fg_color="transparent")
-        actions.pack(fill="x", padx=24, pady=16)
-        ctk.CTkButton(actions, text="Cancel", fg_color="transparent", command=self.destroy).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(actions, text="Save", command=self.submit).pack(side="right")
-
-    def submit(self):
-        values = {key: entry.get().strip() for key, entry in self.entries.items()}
-        if all(values.values()):
-            self.grab_release()
-            self.destroy()
-            self.on_submit(values)
-
-
-class FeedTile(ctk.CTkFrame):
-    def __init__(self, master, feed, on_drop, on_delete, on_thumbnail):
-        super().__init__(master, fg_color="#1b1b1b", corner_radius=8)
-        self.feed = feed
-        self.on_drop = on_drop
-        self.thumbnail = ctk.CTkLabel(self, text="VIDEO", height=88, fg_color="#292929", corner_radius=5)
-        self.thumbnail.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(self, text=feed["name"], anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", padx=10)
-        ctk.CTkLabel(self, text="Drag to a playback", text_color="#888888", anchor="w").pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkButton(self, text="Remove", width=70, height=23, fg_color="transparent", command=lambda: on_delete(self)).pack(pady=(0, 8))
-        for widget in (self, self.thumbnail):
-            widget.bind("<ButtonPress-1>", lambda _event: self.configure(border_width=2, border_color="#3b82f6"))
-            widget.bind("<ButtonRelease-1>", self._release)
-        on_thumbnail(self, feed)
+    def _motion(self, event):
+        self.app.update_feed_drag(event.x_root, event.y_root)
 
     def _release(self, event):
-        self.configure(border_width=0)
-        self.on_drop(self, event.x_root, event.y_root)
+        self.app.end_feed_drag(event.x_root, event.y_root)
+
+    def show_menu(self, event=None):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Add to output...", command=lambda: self.app.quick_add_feed(self.feed))
+        menu.add_command(label="Edit feed", command=lambda: self.app.edit_feed(self.feed))
+        menu.add_command(label="Delete feed", command=lambda: self.app.delete_feed(self))
+        try:
+            x_root = event.x_root if event is not None else self.winfo_pointerx()
+            y_root = event.y_root if event is not None else self.winfo_pointery()
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
 
-class PlaybackTile(ctk.CTkFrame):
-    def __init__(self, master, playback, callbacks):
-        super().__init__(master, fg_color="#1b1b1b", corner_radius=8)
+class LoadingPopup(tk.Toplevel):
+    """Dark modal popup showing progress while a playback is loading."""
+
+    def __init__(self, master, total_streams: int, target_window=None):
+        super().__init__(master)
+
+        self.target_window = target_window
+        self.configure(bg="#202329")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.transient(master)
+
+        self.total = max(1, total_streams)
+        self.completed = 0
+        self._poll_id = None
+        self._closing = False
+        self._done_queue = queue.Queue()
+
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        outer = ctk.CTkFrame(self, fg_color="#202329", corner_radius=12, border_width=1, border_color="#343a42")
+        outer.pack(fill="both", expand=True, padx=0, pady=0)
+
+        header = ctk.CTkFrame(outer, fg_color="#1b1d22", corner_radius=12)
+        header.pack(fill="x", padx=0, pady=0)
+
+        ctk.CTkLabel(
+            header,
+            text="Loading Playback...",
+            text_color="#e7ebf1",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w"
+        ).pack(side="left", padx=(12, 0), pady=(8, 7), fill="x", expand=True)
+
+        close_button = ctk.CTkButton(
+            header,
+            text="âœ•",
+            width=24,
+            height=22,
+            corner_radius=10,
+            fg_color="#cc4d4d",
+            hover_color="#e56060",
+            text_color="#ffffff",
+            border_width=0,
+            command=self.close,
+        )
+        close_button.pack(side="right", padx=(0, 10), pady=(8, 7))
+
+        content = ctk.CTkFrame(outer, fg_color="#202329")
+        content.pack(fill="both", expand=True, padx=0, pady=0)
+
+        ctk.CTkLabel(
+            content,
+            text="This should take just a moment!",
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=15, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(16, 5))
+
+        self.status_label = ctk.CTkLabel(
+            content,
+            text="Preparing playback...",
+            text_color="#7f8792"
+        )
+        self.status_label.pack(anchor="w", padx=20, pady=(0, 8))
+
+        self.progress_bar = ctk.CTkProgressBar(
+            content,
+            width=300,
+            height=14,
+            fg_color="#30343b",
+            progress_color="#2f8cff"
+        )
+        self.progress_bar.set(0)
+        self.progress_bar.pack(padx=20, pady=(0, 15))
+
+        self.update_idletasks()
+
+        parent_x = master.winfo_rootx()
+        parent_y = master.winfo_rooty()
+        parent_w = master.winfo_width()
+        parent_h = master.winfo_height()
+
+        popup_w = 340
+        popup_h = 130
+
+        x = parent_x + max(0, (parent_w - popup_w) // 2)
+        y = parent_y + max(0, (parent_h - popup_h) // 2)
+        self.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
+        self.deiconify()
+        self.update_idletasks()
+        self.update()
+        self.lift()
+        self.focus_force()
+
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+        self._poll_id = self.after(50, self._poll_updates)
+
+    def mark_done(self):
+        if self._closing or not self.winfo_exists():
+            return
+        try:
+            self._done_queue.put_nowait(1)
+        except Exception:
+            pass
+
+    def _poll_updates(self):
+        if self._closing or not self.winfo_exists():
+            return
+
+        while True:
+            try:
+                self._done_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.completed = min(self.completed + 1, self.total)
+
+        self.status_label.configure(text="Preparing playback...")
+        self.progress_bar.set(self.completed / self.total)
+
+        if self.completed >= self.total:
+            self._closing = True
+            if self.target_window is not None and self.target_window.winfo_exists():
+                self.after(0, lambda: self.master.show_playback_window(self.target_window))
+            self.after(200, self.close)
+            return
+
+        self._poll_id = self.after(50, self._poll_updates)
+
+    def close(self):
+        if self._closing is False:
+            self._closing = True
+
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+
+        try:
+            if self._poll_id is not None:
+                self.after_cancel(self._poll_id)
+                self._poll_id = None
+        except (tk.TclError, AttributeError):
+            pass
+
+        try:
+            if self.winfo_exists():
+                self.withdraw()
+        except tk.TclError:
+            pass
+
+        try:
+            self.after(120, self._final_destroy)
+        except tk.TclError:
+            pass
+
+    def _final_destroy(self):
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except tk.TclError:
+            pass
+
+
+class PlaceholderPane(ctk.CTkFrame):
+    """Placeholder pane for grid slots without an assigned feed."""
+
+    def __init__(self, master, window_title: str, box_number: int):
+        super().__init__(master, fg_color="#080808", corner_radius=6)
+        
+        container = ctk.CTkFrame(self, fg_color="#121212", corner_radius=4)
+        container.pack(fill="both", expand=True, padx=2, pady=2)
+
+        ctk.CTkLabel(
+            container,
+            text=f"{window_title}: {box_number}",
+            text_color="#555555",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(expand=True)
+
+    def stop(self):
+        self.destroy()
+
+class OutputTile(ctk.CTkFrame):
+    """Output card showing a thumbnail grid of the feeds assigned to it."""
+
+    def __init__(self, master, playback, app):
+        super().__init__(master, fg_color="#25282e", corner_radius=7)
         self.playback = playback
-        self.callbacks = callbacks
-        ctk.CTkLabel(self, text="PLAYBACK WINDOW", text_color="#6ba4ff").pack(anchor="w", padx=14, pady=(12, 0))
-        ctk.CTkLabel(self, text=playback["name"], font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=14, pady=2)
-        self.count = ctk.CTkLabel(self, text="")
-        self.count.pack(anchor="w", padx=14)
-        controls = ctk.CTkFrame(self, fg_color="transparent")
-        controls.pack(fill="x", padx=12, pady=14)
-        ctk.CTkButton(controls, text="-", width=30, height=28, command=lambda: callbacks["count"](self, -1)).pack(side="left")
-        ctk.CTkButton(controls, text="+", width=30, height=28, command=lambda: callbacks["count"](self, 1)).pack(side="left", padx=5)
-        ctk.CTkButton(controls, text="Open", width=65, height=28, command=lambda: callbacks["open"](self)).pack(side="right")
-        ctk.CTkButton(controls, text="Rename", width=70, height=28, fg_color="transparent", command=lambda: callbacks["rename"](self)).pack(side="right", padx=5)
-        ctk.CTkButton(self, text="Delete", width=60, height=21, fg_color="transparent", command=lambda: callbacks["delete"](self)).pack(pady=(0, 8))
-        self.refresh()
+        self.app = app
+        self.playback["feeds"] = list(self.playback.get("feeds", []))
+        if not self.playback["feeds"]:
+            self.playback["feeds"] = [None]
+        self.preview = ctk.CTkFrame(self, fg_color="#17191d", corner_radius=2)
+        self.preview.pack(fill="x", padx=10, pady=(10, 0))
+        self._highlighted = False
+        self._slot_cells = {}
 
-    def refresh(self):
-        self.count.configure(text=f"{len(self.playback['feeds'])} feeds assigned")
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(8, 3))
+        ctk.CTkButton(
+            header, text="â†—", width=27, height=25, fg_color="transparent",
+            hover_color="#343942", command=self.open_output
+        ).pack(side="left")
+        ctk.CTkLabel(
+            header, text=playback.get("name", "Output"), anchor="w",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            header, text="â‹®", width=27, height=25, fg_color="transparent",
+            hover_color="#343942", command=self.show_menu
+        ).pack(side="right")
 
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=12, pady=(2, 10))
+        ctk.CTkLabel(footer, text="Feeds:", anchor="w").pack(side="left")
+        ctk.CTkButton(
+            footer, text="âˆ’", width=28, height=25,
+            fg_color="#30343b", hover_color="#3b4049",
+            command=self.remove_last_feed
+        ).pack(side="left", padx=(5, 3))
+        self.count_var = tk.StringVar(value=str(len(self.playback["feeds"])))
+        self.count_entry = ctk.CTkEntry(
+            footer,
+            width=36,
+            height=25,
+            textvariable=self.count_var,
+            justify="center",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.count_entry.pack(side="left")
+        self.count_entry.bind("<Return>", self._apply_feed_count)
+        self.count_entry.bind("<FocusOut>", self._apply_feed_count)
+        ctk.CTkButton(
+            footer, text="+", width=28, height=25,
+            fg_color="#30343b", hover_color="#3b4049",
+            command=self.add_next_feed
+        ).pack(side="left", padx=(3, 10))
+        ctk.CTkLabel(
+            footer, text="Drag feeds here", text_color="#6f7782",
+            anchor="w"
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            footer, text="Edit", width=55, height=25, fg_color="transparent",
+            hover_color="#343942", command=lambda: self.app.edit_playback(self.playback)
+        ).pack(side="right")
+        self.app.output_tiles.append(self)
+        self.render()
+
+    def contains_root_point(self, x, y):
+        if not self.winfo_exists():
+            return False
+        left = self.winfo_rootx()
+        top = self.winfo_rooty()
+        return left <= x <= left + self.winfo_width() and top <= y <= top + self.winfo_height()
+
+    def slot_at_point(self, x, y):
+        for index, cell in self._slot_cells.items():
+            if not cell.winfo_exists():
+                continue
+            left = cell.winfo_rootx()
+            top = cell.winfo_rooty()
+            if left <= x <= left + cell.winfo_width() and top <= y <= top + cell.winfo_height():
+                return index
+        return None
+
+    def set_slot_highlight(self, index):
+        for slot_index, cell in self._slot_cells.items():
+            cell.configure(
+                border_width=2 if slot_index == index else 0,
+                border_color="#2f8cff"
+            )
+
+    def set_drop_highlight(self, enabled):
+        if enabled == self._highlighted:
+            return
+        self._highlighted = enabled
+        self.configure(
+            border_width=2 if enabled else 0,
+            border_color="#2f8cff" if enabled else self.cget("fg_color")
+        )
+
+    def render(self):
+        for child in self.preview.winfo_children():
+            child.destroy()
+
+        feed_names = self.playback.setdefault("feeds", [None])
+        self.count_var.set(str(len(feed_names)))
+        self._slot_cells = {}
+
+        playback_name = self.playback.get("name", "Output")
+        columns = 3
+
+        for index, feed_name in enumerate(feed_names):
+            cell = ctk.CTkFrame(self.preview, fg_color="#0f1012", corner_radius=1)
+            cell.grid(row=index // columns, column=index % columns, sticky="nsew", padx=1, pady=1)
+            self._slot_cells[index] = cell
+
+            feed = next((f for f in self.app.feeds if f.get("name") == feed_name), None) if feed_name else None
+
+            if not feed:
+                placeholder_box = ctk.CTkFrame(cell, fg_color="#191b1f", corner_radius=2)
+                placeholder_box.pack(fill="both", expand=True)
+                ctk.CTkLabel(
+                    placeholder_box,
+                    text=f"{playback_name}: {index + 1}",
+                    text_color="#666d78",
+                    font=ctk.CTkFont(size=11, weight="bold")
+                ).pack(fill="both", expand=True, padx=4, pady=12)
+                continue
+
+            label = ctk.CTkLabel(cell, text="", height=82, fg_color="#191b1f")
+            label.pack(fill="both", expand=True)
+            ctk.CTkLabel(
+                cell, text=feed.get("name", "Feed"), anchor="w",
+                font=ctk.CTkFont(size=9, weight="bold")
+            ).pack(fill="x", padx=4, pady=(2, 3))
+            self.app.load_thumbnail(label, feed, (150, 82))
+            self._bind_slot_drag(cell, feed, index)
+
+        rows = max(1, (len(feed_names) + columns - 1) // columns)
+        for column in range(columns):
+            self.preview.grid_columnconfigure(column, weight=1, uniform="preview")
+        for row in range(rows):
+            self.preview.grid_rowconfigure(row, weight=1, uniform="preview")
+
+    def _bind_slot_drag(self, widget, feed, index):
+        widget.bind(
+            "<ButtonPress-1>",
+            lambda event: self.app.begin_feed_drag(
+                feed, event.x_root, event.y_root,
+                source=(self.playback, index),
+            ),
+            add="+",
+        )
+        widget.bind(
+            "<B1-Motion>",
+            lambda event: self.app.update_feed_drag(event.x_root, event.y_root),
+            add="+",
+        )
+        widget.bind(
+            "<ButtonRelease-1>",
+            lambda event: self.app.end_feed_drag(event.x_root, event.y_root),
+            add="+",
+        )
+        widget.bind(
+            "<Button-3>",
+            lambda event: self._show_feed_menu(feed, event),
+            add="+",
+        )
+        for child in widget.winfo_children():
+            self._bind_slot_drag(child, feed, index)
+
+    def _show_feed_menu(self, feed, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Edit feed", command=lambda: self.app.edit_feed(feed))
+        menu.add_command(label="Delete feed", command=lambda: self.app.delete_feed(feed))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def add_next_feed(self):
+        assigned = self.playback.setdefault("feeds", [None])
+        assigned.append(None)
+        self.app.save_data()
+        self.app.render_playbacks()
+        self.app.refresh_open_playback(self.playback)
+
+    def _apply_feed_count(self, _event=None):
+        try:
+            count = max(1, int(self.count_var.get()))
+        except ValueError:
+            self.count_var.set(str(len(self.playback.get("feeds", [None]))))
+            return
+
+        assigned = self.playback.setdefault("feeds", [None])
+        if count > len(assigned):
+            assigned.extend([None] * (count - len(assigned)))
+        elif count < len(assigned):
+            del assigned[count:]
+        else:
+            return
+
+        self.app.save_data()
+        self.app.render_feeds()
+        self.app.render_playbacks()
+        self.app.refresh_open_playback(self.playback)
+
+    def remove_last_feed(self):
+        assigned = self.playback.setdefault("feeds", [None])
+        if len(assigned) > 1:
+            assigned.pop()
+            self.app.save_data()
+            self.app.render_playbacks()
+            self.app.refresh_open_playback(self.playback)
+
+    def open_output(self):
+        self.app.open_playback(self.playback)
+
+    def show_menu(self):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Open output", command=self.open_output)
+        menu.add_command(label="Rename", command=lambda: self.app.rename_playback(self.playback))
+        menu.add_command(label="Clear feeds", command=lambda: self.app.clear_output(self.playback))
+        menu.add_separator()
+        menu.add_command(label="Delete output", command=lambda: self.app.delete_playback(self.playback))
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
 
 class MainWindow(ctk.CTk):
+    """Downlink Hub redesigned around a feed sidebar and output dashboard."""
+
     def __init__(self):
         super().__init__()
         self.title("Downlink Hub")
-        self.geometry("1050x680")
-        self.minsize(800, 520)
+        self.geometry("1180x760")
+        self.minsize(900, 600)
         self.vlc_instance = vlc.Instance([
             "--no-xlib",
             "--avcodec-hw=none",
-            "--network-caching=3000",
-            "--live-caching=3000",
-            "--clock-jitter=0",
-            "--clock-synchro=0",
+            "--vout=direct3d11",
+            "--network-caching=500",
+            "--live-caching=500",
         ])
         if not self.vlc_instance:
             raise RuntimeError("Failed to initialize libVLC instance.")
+
         self.feeds, self.playbacks = self._load_data()
         self.windows = {}
+        self.active_window = None
+        self._thumbnail_refs = []
+        self._thumbnail_cache = {}
+
+        self.output_tiles = []
+        self._drag_feed = None
+        self._drag_source = None
+        self._drag_feed_start = None
+        self._drag_active = False
+        self._drag_ghost = None
         self._build_ui()
         self.render_feeds()
         self.render_playbacks()
 
     def _build_ui(self):
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=22, pady=(18, 10))
-        ctk.CTkLabel(header, text="Downlink Hub", font=ctk.CTkFont(size=26, weight="bold")).pack(side="left")
-        ctk.CTkButton(header, text="+ Playback", width=105, command=self.add_playback).pack(side="right")
-        ctk.CTkButton(header, text="+ Feed", width=85, command=self.add_feed).pack(side="right", padx=8)
+        self.configure(fg_color="#202329")
+
+        top = ctk.CTkFrame(self, fg_color="#202329", height=42, corner_radius=0)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        ctk.CTkLabel(
+            top, text="Downlink", anchor="w",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(side="left", padx=16)
+        ctk.CTkButton(
+            top, text="+ Playback", width=105, height=28,
+            command=self.add_playback
+        ).pack(side="right", padx=8, pady=7)
+        ctk.CTkButton(
+            top, text="+ Feed", width=80, height=28,
+            command=self.add_feed
+        ).pack(side="right", pady=7)
+
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=18)
-        left = ctk.CTkFrame(body, width=235, fg_color="#141414")
-        left.pack(side="left", fill="y", padx=(0, 12))
-        left.pack_propagate(False)
-        ctk.CTkLabel(left, text="SAVED FEEDS", anchor="w", font=ctk.CTkFont(size=12, weight="bold")).pack(fill="x", padx=14, pady=14)
-        self.feed_area = ctk.CTkScrollableFrame(left, fg_color="transparent")
-        self.feed_area.pack(fill="both", expand=True, padx=5)
-        center = ctk.CTkFrame(body, fg_color="transparent")
-        center.pack(side="left", fill="both", expand=True)
-        ctk.CTkLabel(center, text="PLAYBACK WINDOWS", anchor="w", font=ctk.CTkFont(size=12, weight="bold")).pack(fill="x", padx=4, pady=14)
-        self.playback_area = ctk.CTkScrollableFrame(center, fg_color="transparent")
-        self.playback_area.pack(fill="both", expand=True)
-        self.status = ctk.CTkLabel(self, text="Drag a feed from the left onto a playback window.", text_color="#888888")
-        self.status.pack(pady=8)
+        body.pack(fill="both", expand=True)
+
+        sidebar = ctk.CTkFrame(body, width=275, fg_color="#191b20", corner_radius=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        ctk.CTkLabel(
+            sidebar, text="Feeds", anchor="w",
+            font=ctk.CTkFont(size=27, weight="bold")
+        ).pack(fill="x", padx=20, pady=(18, 12))
+
+        self.add_feed_card = ctk.CTkButton(
+            sidebar, text="ï¼‹", width=220, height=78,
+            fg_color="#292d34", hover_color="#333840",
+            border_width=1, border_color="#69717d",
+            font=ctk.CTkFont(size=28), command=self.add_feed
+        )
+        self.add_feed_card.pack(fill="x", padx=20, pady=(0, 10))
+
+        self.feed_area = ctk.CTkScrollableFrame(sidebar, fg_color="transparent")
+        self.feed_area.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        separator = ctk.CTkFrame(body, width=2, fg_color="#586b90", corner_radius=0)
+        separator.pack(side="left", fill="y")
+
+        main = ctk.CTkFrame(body, fg_color="#202329", corner_radius=0)
+        main.pack(side="left", fill="both", expand=True)
+
+        ctk.CTkLabel(
+            main, text="Outputs", anchor="w",
+            font=ctk.CTkFont(size=31, weight="bold")
+        ).pack(fill="x", padx=32, pady=(20, 12))
+
+        self.output_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        self.output_area.pack(fill="both", expand=True, padx=22, pady=(0, 10))
+
+        self.status = ctk.CTkLabel(main, text="", text_color="#7f8792")
+        self.status.pack(fill="x", padx=30, pady=(0, 8))
 
     def _load_data(self):
         try:
@@ -779,127 +1000,539 @@ class MainWindow(ctk.CTk):
     def render_feeds(self):
         for child in self.feed_area.winfo_children():
             child.destroy()
+
+        assigned_names = {
+            name
+            for playback in self.playbacks
+            for name in playback.get("feeds", [])
+            if name
+        }
+        groups = {}
         for feed in self.feeds:
-            FeedTile(self.feed_area, feed, self.drop_feed, self.delete_feed, self.load_thumbnail).pack(fill="x", padx=4, pady=6)
+            if feed.get("name") in assigned_names:
+                continue
+            group = feed.get("group") or "Feeds"
+            groups.setdefault(group, []).append(feed)
+
+        for group_name, feeds in groups.items():
+            ctk.CTkLabel(
+                self.feed_area, text=group_name, anchor="w",
+                font=ctk.CTkFont(size=16, weight="bold")
+            ).pack(fill="x", padx=5, pady=(8, 4))
+            for feed in feeds:
+                tile = FeedSidebarTile(self.feed_area, feed, self)
+                tile.pack(fill="x", padx=2, pady=4)
+                self.load_thumbnail(tile.thumbnail, feed, (72, 78))
 
     def render_playbacks(self):
-        for child in self.playback_area.winfo_children():
+        for child in self.output_area.winfo_children():
             child.destroy()
-        callbacks = {"open": self.open_playback, "count": self.change_count, "delete": self.delete_playback, "rename": self.rename_playback}
-        for playback in self.playbacks:
-            PlaybackTile(self.playback_area, playback, callbacks).pack(fill="x", padx=8, pady=8)
 
-    def load_thumbnail(self, tile, feed):
-        if not feed.get("thumbnail"):
+        self.output_tiles = []
+
+        if not self.playbacks:
+            empty = ctk.CTkLabel(
+                self.output_area,
+                text="No outputs yet\nCreate one with + Playback, then drag feeds here.",
+                text_color="#777f8b", font=ctk.CTkFont(size=15)
+            )
+            empty.pack(expand=True, pady=120)
             return
+
+        for playback in self.playbacks:
+            OutputTile(self.output_area, playback, self).pack(fill="x", padx=8, pady=9)
+
+    def load_thumbnail(self, widget, feed, size):
+        thumbnail_url = feed.get("thumbnail")
+        if not thumbnail_url and is_youtube_url(feed.get("url", "")):
+            video_id = youtube_video_id(feed["url"])
+            thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+        if not thumbnail_url:
+            widget.configure(text="LIVE", text_color="#666d78")
+            return
+
+        cached_image = self._thumbnail_cache.get(thumbnail_url)
+        if cached_image is not None:
+            self.set_thumbnail(widget, cached_image)
+            return
+
         def fetch():
             try:
                 from PIL import Image
-                image = Image.open(BytesIO(urlopen(feed["thumbnail"], timeout=8).read()))
-                image.thumbnail((194, 84))
-                self.after(0, lambda: self.set_thumbnail(tile, image))
+                image_data = None
+                loaded_url = thumbnail_url
+                for candidate_url in (
+                    thumbnail_url,
+                    thumbnail_url.replace("/maxresdefault.jpg", "/hqdefault.jpg"),
+                ):
+                    try:
+                        image_data = urlopen(candidate_url, timeout=8).read()
+                        loaded_url = candidate_url
+                        break
+                    except Exception:
+                        continue
+                if image_data is None:
+                    raise OSError("thumbnail unavailable")
+                image = Image.open(BytesIO(image_data)).convert("RGB")
+                image.thumbnail(size)
+                self._thumbnail_cache[thumbnail_url] = image
+                if not feed.get("thumbnail") and is_youtube_url(feed.get("url", "")):
+                    feed["thumbnail"] = loaded_url
+                    self.after(0, self.save_data)
+                self.after(0, lambda: self.set_thumbnail(widget, image))
             except Exception:
-                pass
+                self.after(0, lambda: widget.configure(text="LIVE", text_color="#666d78"))
+
         threading.Thread(target=fetch, daemon=True).start()
 
-    def set_thumbnail(self, tile, image):
-        if tile.winfo_exists():
-            tile.thumbnail_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
-            tile.thumbnail.configure(image=tile.thumbnail_image, text="")
+    def set_thumbnail(self, widget, image):
+        if widget.winfo_exists():
+            ref = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
+            widget.image_ref = ref
+            widget.configure(image=ref, text="")
 
     def add_feed(self):
-        ThemedForm(self, "Add saved feed", [("name", "Name", ""), ("url", "Link", "https://...")], self.finish_feed)
+        ThemedForm(
+            self, "Add saved feed",
+            [("name", "Name", ""), ("url", "Link", "https://..."), ("group", "Group", "Feeds")],
+            self.finish_feed
+        )
 
     def finish_feed(self, values):
-        self.feeds.append({"name": values["name"], "url": values["url"], "thumbnail": None})
+        self.feeds.append({
+            "name": values["name"],
+            "url": values["url"],
+            "group": values.get("group") or "Feeds",
+            "thumbnail": None,
+        })
         self.save_data()
         self.render_feeds()
 
-    def delete_feed(self, tile):
-        self.feeds.remove(tile.feed)
+    def edit_feed(self, feed):
+        ThemedForm(
+            self,
+            "Edit saved feed",
+            [
+                ("name", "Name", feed.get("name", "")),
+                ("url", "Link", feed.get("url", "")),
+                ("group", "Group", feed.get("group", "Feeds")),
+            ],
+            lambda values: self.finish_edit_feed(feed, values),
+        )
+
+    def finish_edit_feed(self, feed, values):
+        if feed not in self.feeds:
+            return
+        old_name = feed.get("name")
+        new_name = values["name"]
+        feed.update({
+            "name": new_name,
+            "url": values["url"],
+            "group": values.get("group") or "Feeds",
+        })
+        if old_name != new_name:
+            for playback in self.playbacks:
+                playback["feeds"] = [new_name if name == old_name else name for name in playback.get("feeds", [])]
         self.save_data()
         self.render_feeds()
+        self.render_playbacks()
+        for playback in self.playbacks:
+            self.refresh_open_playback(playback)
+
+    def delete_feed(self, tile_or_feed):
+        feed = getattr(tile_or_feed, "feed", tile_or_feed)
+        if feed not in self.feeds:
+            return
+        self.feeds.remove(feed)
+        # Remove deleted feed from all outputs too.
+        name = feed.get("name")
+        for playback in self.playbacks:
+            playback["feeds"] = [None if n == name else n for n in playback.get("feeds", [])]
+        self.save_data()
+        self.render_feeds()
+        self.render_playbacks()
+        for playback in self.playbacks:
+            self.refresh_open_playback(playback)
 
     def add_playback(self):
-        ThemedForm(self, "New playback window", [("name", "Name", "Playback")], self.finish_playback)
+        ThemedForm(
+            self, "New output",
+            [("name", "Name", f"Output {len(self.playbacks) + 1}")],
+            self.finish_playback
+        )
 
     def finish_playback(self, values):
-        self.playbacks.append({"name": values["name"], "feeds": []})
+        self.playbacks.append({"name": values["name"], "feeds": [None]})
         self.save_data()
         self.render_playbacks()
 
-    def rename_playback(self, tile):
-        ThemedForm(self, "Rename playback", [("name", "Name", tile.playback["name"])], lambda values: self.finish_rename(tile, values))
+    def rename_playback(self, playback):
+        ThemedForm(
+            self, "Rename output", [("name", "Name", playback["name"])],
+            lambda values: self.finish_rename(playback, values)
+        )
 
-    def finish_rename(self, tile, values):
-        tile.playback["name"] = values["name"]
+    def edit_playback(self, playback):
+        ThemedForm(
+            self,
+            "Edit output",
+            [
+                ("name", "Name", playback.get("name", "Output")),
+                ("feed_count", "Feeds", str(len(playback.get("feeds", [None])))),
+            ],
+            lambda values: self.finish_edit_playback(playback, values),
+        )
+
+    def finish_edit_playback(self, playback, values):
+        try:
+            feed_count = max(1, int(values["feed_count"]))
+        except ValueError:
+            messagebox.showerror("Invalid feed count", "Feeds must be a whole number.", parent=self)
+            return
+
+        old_name = playback.get("name")
+        new_name = values["name"]
+        assigned = playback.setdefault("feeds", [None])
+        if feed_count > len(assigned):
+            assigned.extend([None] * (feed_count - len(assigned)))
+        else:
+            del assigned[feed_count:]
+
+        playback["name"] = new_name
+        window = self.windows.pop(old_name, None)
+        if window is not None and window.winfo_exists():
+            window.title(new_name)
+            if hasattr(window, "_titlebar"):
+                window._titlebar.title_label.configure(text=new_name)
+            self.windows[new_name] = window
+
+        self.save_data()
+        self.render_feeds()
+        self.render_playbacks()
+        self.refresh_open_playback(playback)
+
+    def finish_rename(self, playback, values):
+        playback["name"] = values["name"]
         self.save_data()
         self.render_playbacks()
 
-    def delete_playback(self, tile):
-        self.playbacks.remove(tile.playback)
-        window = self.windows.pop(id(tile.playback), None)
+    def clear_output(self, playback):
+        playback["feeds"] = [None] * max(1, len(playback.get("feeds", [])))
+        self.save_data()
+        self.render_playbacks()
+        self.refresh_open_playback(playback)
+
+    def delete_playback(self, playback):
+        if playback not in self.playbacks:
+            return
+        self.playbacks.remove(playback)
+        window = self.windows.pop(id(playback), None)
         if window and window.winfo_exists():
             window._on_close()
         self.save_data()
         self.render_playbacks()
 
-    def change_count(self, tile, amount):
-        feeds = tile.playback["feeds"]
-        if amount > 0 and feeds:
-            feeds.append(feeds[-1])
-        elif amount < 0 and feeds:
-            feeds.pop()
-        tile.refresh()
+    def begin_feed_drag(self, feed, x, y, source=None):
+        self._drag_feed = feed
+        self._drag_source = source
+        self._drag_feed_start = (x, y)
+        self._drag_active = False
+
+    def update_feed_drag(self, x, y):
+        if self._drag_feed is None or self._drag_feed_start is None:
+            return
+
+        sx, sy = self._drag_feed_start
+        if not self._drag_active:
+            if abs(x - sx) + abs(y - sy) < 10:
+                return
+            self._drag_active = True
+            self._create_drag_ghost(self._drag_feed.get("name", "Feed"))
+
+        if self._drag_ghost is not None:
+            self._drag_ghost.geometry(f"+{x + 14}+{y + 14}")
+        self._update_drop_target(x, y)
+
+    def end_feed_drag(self, x, y):
+        if self._drag_feed is None:
+            return
+        if self._drag_active:
+            self._drop_feed_at_point(self._drag_feed, x, y)
+        self._clear_drop_highlights()
+        self._destroy_drag_ghost()
+        self._drag_feed = None
+        self._drag_source = None
+        self._drag_feed_start = None
+        self._drag_active = False
+
+    def _create_drag_ghost(self, name):
+        self._destroy_drag_ghost()
+        ghost = ctk.CTkToplevel(self)
+        ghost.overrideredirect(True)
+        ghost.attributes("-topmost", True)
+        ghost.attributes("-alpha", 0.88)
+        ghost.configure(fg_color="#2f8cff")
+        ctk.CTkLabel(
+            ghost, text=f"  {name}  ", text_color="white", fg_color="#2f8cff",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(padx=1, pady=1)
+        ghost.update_idletasks()
+        self._drag_ghost = ghost
+
+    def _destroy_drag_ghost(self):
+        if self._drag_ghost is not None:
+            try:
+                self._drag_ghost.destroy()
+            except tk.TclError:
+                pass
+            self._drag_ghost = None
+
+    def _update_drop_target(self, x, y):
+        target = None
+        for output in self.output_tiles:
+            slot = output.slot_at_point(x, y)
+            if slot is not None:
+                target = (output, slot)
+                break
+        for output in self.output_tiles:
+            output.set_drop_highlight(False)
+            output.set_slot_highlight(target[1] if target and output is target[0] else None)
+
+    def _clear_drop_highlights(self):
+        for output in self.output_tiles:
+            output.set_drop_highlight(False)
+            output.set_slot_highlight(None)
+
+    def _drop_feed_at_point(self, feed, x, y):
+        target = next(
+            ((output, output.slot_at_point(x, y)) for output in self.output_tiles
+             if output.slot_at_point(x, y) is not None),
+            None
+        )
+        if target is None:
+            if self._drag_source is not None:
+                self._clear_source_slot()
+                self.save_data()
+                self.status.configure(text=f"Returned {feed.get('name')} to the feed list.")
+                self.render_playbacks()
+                self.render_feeds()
+                self.refresh_open_playback(self._drag_source[0])
+            else:
+                self.status.configure(text="Drop the feed onto a preset slot.")
+            return
+        self.drop_feed_at(target[0].playback, target[1])
+
+    def _clear_source_slot(self):
+        if self._drag_source is None:
+            return
+        source_playback, source_index = self._drag_source
+        assigned = source_playback.setdefault("feeds", [None])
+        if 0 <= source_index < len(assigned):
+            assigned[source_index] = None
+
+    def drop_feed_at(self, playback, slot_index=None):
+        if self._drag_feed is None or slot_index is None:
+            return
+        feed = self._drag_feed
+        name = feed.get("name")
+        assigned = playback.setdefault("feeds", [None])
+        if slot_index >= len(assigned):
+            return
+        if self._drag_source is not None:
+            source_playback, source_index = self._drag_source
+            if source_playback is playback and source_index == slot_index:
+                return
+            self._clear_source_slot()
+        assigned[slot_index] = name
         self.save_data()
+        self.status.configure(text=f"Placed {name} in slot {slot_index + 1} of {playback['name']}.")
+        self.render_playbacks()
+        self.render_feeds()
+        self.refresh_open_playback(playback)
+        if self._drag_source is not None and self._drag_source[0] is not playback:
+            self.refresh_open_playback(self._drag_source[0])
 
-    def drop_feed(self, feed_tile, x, y):
-        widget = self.winfo_containing(x, y)
-        while widget is not None and not isinstance(widget, PlaybackTile):
-            widget = widget.master
-        if isinstance(widget, PlaybackTile):
-            widget.playback["feeds"].append(feed_tile.feed["name"])
-            widget.refresh()
+    def quick_add_feed(self, feed):
+        for playback in self.playbacks:
+            assigned = playback.setdefault("feeds", [None])
+            try:
+                slot_index = assigned.index(None)
+            except ValueError:
+                continue
+            assigned[slot_index] = feed.get("name")
             self.save_data()
-            self.status.configure(text=f"Added {feed_tile.feed['name']} to {widget.playback['name']}.")
+            self.status.configure(text=f"Placed {feed.get('name')} in slot {slot_index + 1} of {playback['name']}.")
+            self.render_playbacks()
+            self.render_feeds()
+            self.refresh_open_playback(playback)
+            return
+        self.status.configure(text="Add a preset slot before assigning this feed.")
 
-    def open_playback(self, tile):
-        playback = tile.playback
-        window = self.windows.get(id(playback))
+    def open_playback(self, playback):
+        # Use a stable key (e.g., playback name or unique ID) instead of id(playback)
+        playback_id = playback.get("name", id(playback))
+        
+        window = self.windows.get(playback_id)
         if window is None or not window.winfo_exists():
             window = PlayerWindow(self, title=playback["name"], instance=self.vlc_instance)
-            self.windows[id(playback)] = window
-        for feed_name in playback["feeds"]:
-            feed = next((item for item in self.feeds if item["name"] == feed_name), None)
-            if feed:
-                threading.Thread(target=self.resolve_and_add, args=(feed, window), daemon=True).start()
+            self.windows[playback_id] = window
+        else:
+            # Increment generation counter to invalidate any pending async resolves
+            window._open_generation += 1
+            
+            # Destroy active pane widgets explicitly, not just clear the list
+            for pane in list(window.panes):
+                if hasattr(pane, "stop"):
+                    pane.stop()
+                if hasattr(pane, "destroy"):
+                    pane.destroy()
+            window.panes.clear()
+
+        generation = window._open_generation
+        slots = playback.get("feeds", [])
+
+        window.resize_for_count(len(slots))
+
+        assigned_feeds = [
+            next((item for item in self.feeds if item.get("name") == feed_name), None)
+            for feed_name in slots
+        ]
+        assigned_feeds = [feed for feed in assigned_feeds if feed and feed.get("url")]
+
+        loading_popup = LoadingPopup(self, len(assigned_feeds), window) if assigned_feeds else None
+
+        if loading_popup is not None:
+            window.withdraw()
+            loading_popup.update_idletasks()
+            loading_popup.update()
+            loading_popup.focus_force()
+        else:
+            window.deiconify()
+            window.focus_force()
+
+        for index, feed_name in enumerate(slots):
+            box_number = index + 1
+            if not feed_name:
+                window.add_placeholder(box_number)
+                continue
+
+            feed = next((item for item in self.feeds if item.get("name") == feed_name), None)
+            if not feed:
+                window.add_placeholder(box_number)
+                continue
+
+            if is_youtube_url(feed.get("url", "")):
+                window.add_youtube_feed(feed, generation=generation)
+                if loading_popup is not None:
+                    loading_popup.mark_done()
+            else:
+                threading.Thread(
+                    target=self.resolve_and_add,
+                    args=(feed, window, generation, loading_popup),
+                    daemon=True,
+                ).start()
+
+    def show_playback_window(self, window):
+        if window is None or not window.winfo_exists():
+            return
+        try:
+            window.deiconify()
+        except tk.TclError:
+            pass
+        try:
+            window.focus_force()
+        except tk.TclError:
+            pass
+
+    def refresh_open_playback(self, playback):
+        # Use a stable key (e.g., playback name or unique ID) instead of id(playback)
+        playback_id = playback.get("name", id(playback))
+        window = self.windows.get(playback_id)
+        if window is not None and window.winfo_exists():
+            self.open_playback(playback)
 
     def set_active_window(self, window):
         if window.winfo_exists():
             self.active_window = window
 
-    def resolve_and_add(self, feed, window):
+    def resolve_and_add(self, feed, window, generation, loading_popup=None):
         try:
-            if is_youtube_url(feed["url"]):
-                debug_log(f"[{feed['name']}] YOUTUBE_ROUTE browser original={redact_url(feed['url'])}")
-                self.after(0, lambda: window.add_stream(
-                    "", feed["name"], original_url=feed["url"]
-                ))
-                return
             debug_log(f"[{feed['name']}] RESOLVE_FEED starting original={redact_url(feed['url'])}")
             stream_url, thumbnail, headers = resolve_stream(feed["url"])
+
+            if not self._is_current_playback(window, generation):
+                return
+
             if thumbnail and feed.get("thumbnail") != thumbnail:
                 feed["thumbnail"] = thumbnail
                 self.after(0, self.save_data)
-            self.after(0, lambda: window.add_stream(
-                stream_url, feed["name"], headers=headers, original_url=feed["url"]
+                self.after(0, self.render_feeds)
+                self.after(0, self.render_playbacks)
+
+            self.after(0, lambda: self._add_resolved_stream(
+                window, generation, stream_url, feed["name"], headers, feed["url"]
             ))
         except Exception as exc:
             debug_log(f"[{feed['name']}] RESOLVE_FEED failed error={exc!r}")
+
+            if not self._is_current_playback(window, generation):
+                return
+
             error_message = str(exc)
-            self.after(0, lambda error_message=error_message: messagebox.showerror(
-                "Couldn't play that link", error_message, parent=self
+            self.after(0, lambda msg=error_message: messagebox.showerror(
+                "Couldn't play that link", msg, parent=window
             ))
+        finally:
+            if loading_popup is not None:
+                self.after(0, loading_popup.mark_done)
+
+    def _is_current_playback(self, window, generation):
+        return (
+            window.winfo_exists()
+            and window._open_generation == generation
+            and any(current is window for current in self.windows.values())
+        )
+
+    def _add_resolved_stream(self, window, generation, stream_url, title, headers, original_url):
+        if self._is_current_playback(window, generation):
+            window.add_stream(stream_url, title, headers=headers, original_url=original_url)
+
+
+class ThemedForm(ctk.CTkToplevel):
+    def __init__(self, master, title, fields, on_submit):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("460x270")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.on_submit = on_submit
+        self.entries = {}
+        ctk.CTkLabel(
+            self, text=title,
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(anchor="w", padx=24, pady=(20, 12))
+        for key, label, value in fields:
+            row = ctk.CTkFrame(self, fg_color="transparent")
+            row.pack(fill="x", padx=24, pady=5)
+            ctk.CTkLabel(row, text=label, width=80, anchor="w").pack(side="left")
+            entry = ctk.CTkEntry(row)
+            entry.insert(0, value)
+            entry.pack(side="left", fill="x", expand=True)
+            self.entries[key] = entry
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=24, pady=16)
+        ctk.CTkButton(
+            actions, text="Cancel", fg_color="transparent", command=self.destroy
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(actions, text="Save", command=self.submit).pack(side="right")
+
+    def submit(self):
+        values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        if all(values.values()):
+            self.grab_release()
+            self.destroy()
+            self.on_submit(values)
 
 
 if __name__ == "__main__":
