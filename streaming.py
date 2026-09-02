@@ -75,7 +75,6 @@ def resolve_stream(url: str):
         "no_warnings": True,
         "noplaylist": True,
         "live_from_start": False,
-        "extract_flat": "in_playlist",
         "skip_download": True,
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": True,
@@ -94,6 +93,13 @@ def resolve_stream(url: str):
             stream_url = info.get("url")
             thumbnail = info.get("thumbnail")
             headers = info.get("http_headers", {})
+
+            if not stream_url:
+                playable_formats = [item for item in info.get("formats", []) if item.get("url")]
+                if playable_formats:
+                    selected_format = max(playable_formats, key=lambda item: item.get("height") or 0)
+                    stream_url = selected_format["url"]
+                    headers = selected_format.get("http_headers", headers)
 
             if not stream_url:
                 raise RuntimeError("No valid playback URL found in metadata.")

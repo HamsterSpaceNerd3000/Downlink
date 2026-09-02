@@ -10,14 +10,13 @@ from io import BytesIO
 from urllib.request import urlopen
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import vlc
 
-from app_support import FEEDS_FILE, debug_log
+from app_support import APP_TITLE, FEEDS_FILE, ICON_FILE, debug_log
 from streaming import is_youtube_url, redact_url, resolve_stream, youtube_video_id
-from youtube_player import YouTubeBrowser
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -44,9 +43,9 @@ class StreamPane(ctk.CTkFrame):
         controls.pack(fill="x", padx=2, pady=2)
 
         ctk.CTkLabel(controls, text=title, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
-        self.play_pause_btn = ctk.CTkButton(controls, text="â¸", width=34, height=26, command=self.toggle_play)
+        self.play_pause_btn = ctk.CTkButton(controls, text="||", width=34, height=26, command=self.toggle_play)
         self.play_pause_btn.pack(side="left", padx=(2, 4), pady=4)
-        ctk.CTkButton(controls, text="â¹", width=34, height=26, command=self.stop).pack(side="left", padx=2, pady=4)
+        ctk.CTkButton(controls, text="[]", width=34, height=26, command=self.stop).pack(side="left", padx=2, pady=4)
 
         self.time_slider = ctk.CTkSlider(controls, from_=0, to=1000, command=lambda _value: None)
         self.time_slider.pack(side="left", fill="x", expand=True, padx=4, pady=4)
@@ -189,10 +188,10 @@ class StreamPane(ctk.CTkFrame):
     def toggle_play(self):
         if self.player.is_playing():
             self.player.pause()
-            self.play_pause_btn.configure(text="â–¶")
+            self.play_pause_btn.configure(text=">")
         else:
             self.player.play()
-            self.play_pause_btn.configure(text="â¸")
+            self.play_pause_btn.configure(text="||")
 
     def _on_slider_release(self, _event):
         length = self.player.get_length()
@@ -321,14 +320,16 @@ class StreamPane(ctk.CTkFrame):
 class PlayerWindow(ctk.CTkToplevel):
     """A resizable window containing any number of stream/placeholder panes."""
 
-    def __init__(self, master, title="Downlink Window", instance=None):
+    def __init__(self, master, title=f"{APP_TITLE} Window", instance=None):
         super().__init__(master)
         self.title(title)
+        self.iconbitmap(ICON_FILE)
         self.geometry("380x280")
         self.minsize(380, 280)
         self.vlc_instance = instance or master.vlc_instance
         self.panes = []
         self._open_generation = 0
+        self._layout_size_count = 1
         self.grid_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.grid_frame.pack(fill="both", expand=True, padx=0, pady=0)
         self.bind("<FocusIn>", lambda _event: master.set_active_window(self))
@@ -342,14 +343,6 @@ class PlayerWindow(ctk.CTkToplevel):
     def add_placeholder(self, box_number):
         pane = PlaceholderPane(self.grid_frame, self.title(), box_number)
         self.panes.append(pane)
-        self._configure_layout()
-
-    def add_youtube_feed(self, feed, generation=None):
-        if generation is not None and getattr(self, "_open_generation", None) != generation:
-            return
-        # Single-feed YouTubeBrowser instance per grid slot
-        yt_pane = YouTubeBrowser(self.grid_frame, [feed], self.title())
-        self.panes.append(yt_pane)
         self._configure_layout()
 
     def _configure_layout(self):
@@ -435,7 +428,7 @@ class FeedSidebarTile(ctk.CTkFrame):
         ).pack(fill="x", padx=(0, 3), pady=(2, 0))
 
         self._menu_button = ctk.CTkButton(
-            self, text="â‹®", width=24, height=26, fg_color="transparent",
+            self, text="...", width=24, height=26, fg_color="transparent",
             hover_color="#343942", command=self.show_menu
         )
         self._menu_button.place(relx=1.0, x=-4, y=4, anchor="ne")
@@ -510,7 +503,7 @@ class LoadingPopup(tk.Toplevel):
 
         close_button = ctk.CTkButton(
             header,
-            text="âœ•",
+            text="X",
             width=24,
             height=22,
             corner_radius=10,
@@ -678,7 +671,7 @@ class OutputTile(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(8, 3))
         ctk.CTkButton(
-            header, text="â†—", width=27, height=25, fg_color="transparent",
+            header, text="Open", width=42, height=25, fg_color="transparent",
             hover_color="#343942", command=self.open_output
         ).pack(side="left")
         ctk.CTkLabel(
@@ -686,7 +679,7 @@ class OutputTile(ctk.CTkFrame):
             font=ctk.CTkFont(size=16, weight="bold")
         ).pack(side="left", padx=3)
         ctk.CTkButton(
-            header, text="â‹®", width=27, height=25, fg_color="transparent",
+            header, text="...", width=27, height=25, fg_color="transparent",
             hover_color="#343942", command=self.show_menu
         ).pack(side="right")
 
@@ -694,7 +687,7 @@ class OutputTile(ctk.CTkFrame):
         footer.pack(fill="x", padx=12, pady=(2, 10))
         ctk.CTkLabel(footer, text="Feeds:", anchor="w").pack(side="left")
         ctk.CTkButton(
-            footer, text="âˆ’", width=28, height=25,
+            footer, text="-", width=28, height=25,
             fg_color="#30343b", hover_color="#3b4049",
             command=self.remove_last_feed
         ).pack(side="left", padx=(5, 3))
@@ -882,6 +875,7 @@ class OutputTile(ctk.CTkFrame):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Open output", command=self.open_output)
         menu.add_command(label="Rename", command=lambda: self.app.rename_playback(self.playback))
+        menu.add_command(label="Export feeds...", command=lambda: self.app.export_playback_feeds(self.playback))
         menu.add_command(label="Clear feeds", command=lambda: self.app.clear_output(self.playback))
         menu.add_separator()
         menu.add_command(label="Delete output", command=lambda: self.app.delete_playback(self.playback))
@@ -895,7 +889,8 @@ class MainWindow(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("Downlink Hub")
+        self.title(f"{APP_TITLE} Hub")
+        self.iconbitmap(ICON_FILE)
         self.geometry("1180x760")
         self.minsize(900, 600)
         self.vlc_instance = vlc.Instance([
@@ -931,13 +926,14 @@ class MainWindow(ctk.CTk):
         top.pack(fill="x")
         top.pack_propagate(False)
         ctk.CTkLabel(
-            top, text="Downlink", anchor="w",
+            top, text=APP_TITLE, anchor="w",
             font=ctk.CTkFont(size=16, weight="bold")
         ).pack(side="left", padx=16)
-        ctk.CTkButton(
+        self.add_playback_button = ctk.CTkButton(
             top, text="+ Playback", width=105, height=28,
-            command=self.add_playback
-        ).pack(side="right", padx=8, pady=7)
+            command=self.show_add_playback_menu
+        )
+        self.add_playback_button.pack(side="right", padx=8, pady=7)
         ctk.CTkButton(
             top, text="+ Feed", width=80, height=28,
             command=self.add_feed
@@ -956,7 +952,7 @@ class MainWindow(ctk.CTk):
         ).pack(fill="x", padx=20, pady=(18, 12))
 
         self.add_feed_card = ctk.CTkButton(
-            sidebar, text="ï¼‹", width=220, height=78,
+            sidebar, text="+", width=220, height=78,
             fg_color="#292d34", hover_color="#333840",
             border_width=1, border_color="#69717d",
             font=ctk.CTkFont(size=28), command=self.add_feed
@@ -1161,10 +1157,103 @@ class MainWindow(ctk.CTk):
             self.finish_playback
         )
 
+    def show_add_playback_menu(self):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="New playback", command=self.add_playback)
+        menu.add_command(label="Import playback...", command=self.import_playback)
+        try:
+            x = self.add_playback_button.winfo_rootx()
+            y = self.add_playback_button.winfo_rooty() + self.add_playback_button.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def import_playback(self):
+        input_path = filedialog.askopenfilename(
+            parent=self,
+            title="Import playback",
+            filetypes=[("Downlink playback", "*.dwnlnk")],
+        )
+        if not input_path:
+            return
+        if not input_path.lower().endswith(".dwnlnk"):
+            messagebox.showerror(
+                "Import failed",
+                "Only .dwnlnk playback files can be imported.",
+                parent=self,
+            )
+            return
+        try:
+            with open(input_path, "r", encoding="utf-8") as file:
+                import_data = json.load(file)
+            if import_data.get("format") != "downlink-playback" or import_data.get("version") != 1:
+                raise ValueError("This is not a supported Downlink playback export.")
+            imported_playback = import_data["playback"]
+            imported_feeds = import_data["feeds"]
+            if not isinstance(imported_playback.get("name"), str) or not isinstance(imported_playback.get("feeds"), list):
+                raise ValueError("The playback data is incomplete.")
+            if not isinstance(imported_feeds, list) or not all(
+                isinstance(feed, dict) and isinstance(feed.get("name"), str) and isinstance(feed.get("url"), str)
+                for feed in imported_feeds
+            ):
+                raise ValueError("The feed data is incomplete.")
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Import failed", str(exc), parent=self)
+            return
+
+        existing_feed_names = {feed.get("name") for feed in self.feeds}
+        new_feeds = [feed for feed in imported_feeds if feed["name"] not in existing_feed_names]
+        self.feeds.extend(new_feeds)
+        base_name = imported_playback["name"] or "Imported playback"
+        playback_name = base_name
+        existing_playback_names = {playback.get("name") for playback in self.playbacks}
+        suffix = 2
+        while playback_name in existing_playback_names:
+            playback_name = f"{base_name} ({suffix})"
+            suffix += 1
+        self.playbacks.append({"name": playback_name, "feeds": list(imported_playback["feeds"])})
+        self.save_data()
+        self.render_feeds()
+        self.render_playbacks()
+        self.status.configure(text=f"Imported {playback_name} with {len(new_feeds)} new feed(s)")
+
     def finish_playback(self, values):
         self.playbacks.append({"name": values["name"], "feeds": [None]})
         self.save_data()
         self.render_playbacks()
+
+    def export_playback_feeds(self, playback):
+        feed_names = playback.get("feeds", [])
+        assigned_feeds = [
+            feed for feed in self.feeds
+            if feed.get("name") in feed_names
+        ]
+        default_name = playback.get("name", "playback").replace("/", "-").replace("\\", "-")
+        output_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export playback feeds",
+            initialfile=f"{default_name}",
+            defaultextension=".dwnlnk",
+            filetypes=[("Downlink playback", "*.dwnlnk")],
+        )
+        if not output_path:
+            return
+        export_data = {
+            "format": "downlink-playback",
+            "version": 1,
+            "playback": {
+                "name": playback.get("name", "Output"),
+                "feeds": list(feed_names),
+            },
+            "feeds": assigned_feeds,
+        }
+        try:
+            with open(output_path, "w", encoding="utf-8") as file:
+                json.dump(export_data, file, indent=2)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+        self.status.configure(text=f"Exported {len(assigned_feeds)} feed(s) to {output_path}")
 
     def rename_playback(self, playback):
         ThemedForm(
@@ -1390,6 +1479,11 @@ class MainWindow(ctk.CTk):
 
         generation = window._open_generation
         slots = playback.get("feeds", [])
+        slot_feeds = [
+            next((item for item in self.feeds if item.get("name") == feed_name), None)
+            if feed_name else None
+            for feed_name in slots
+        ]
 
         window.resize_for_count(len(slots))
 
@@ -1416,21 +1510,16 @@ class MainWindow(ctk.CTk):
                 window.add_placeholder(box_number)
                 continue
 
-            feed = next((item for item in self.feeds if item.get("name") == feed_name), None)
+            feed = slot_feeds[index]
             if not feed:
                 window.add_placeholder(box_number)
                 continue
 
-            if is_youtube_url(feed.get("url", "")):
-                window.add_youtube_feed(feed, generation=generation)
-                if loading_popup is not None:
-                    loading_popup.mark_done()
-            else:
-                threading.Thread(
-                    target=self.resolve_and_add,
-                    args=(feed, window, generation, loading_popup),
-                    daemon=True,
-                ).start()
+            threading.Thread(
+                target=self.resolve_and_add,
+                args=(feed, window, generation, loading_popup),
+                daemon=True,
+            ).start()
 
     def show_playback_window(self, window):
         if window is None or not window.winfo_exists():
