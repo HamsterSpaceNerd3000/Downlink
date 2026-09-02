@@ -20,15 +20,39 @@ import customtkinter as ctk
 import webview
 from PIL import Image
 
-from app_support import APP_TITLE, debug_log
+from app_support import (
+    APP_TITLE,
+    YOUTUBE_PROFILE_DIR,
+    YOUTUBE_SESSION_FILE,
+    debug_log,
+)
 from streaming import resolve_stream, youtube_video_id
 
+webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
+
+def _set_youtube_signed_in(signed_in: bool):
+    try:
+        with open(YOUTUBE_SESSION_FILE, "w", encoding="utf-8") as file:
+            json.dump({"signed_in": signed_in}, file)
+    except OSError as exc:
+        debug_log(f"YOUTUBE_SESSION_WRITE_FAILED error={exc!r}")
+
+
+def youtube_signed_in() -> bool:
+    try:
+        with open(YOUTUBE_SESSION_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return bool(data.get("signed_in", False))
+    except (OSError, ValueError, TypeError):
+        return False
 
 class RollingGifBuffer:
     """Keeps a bounded history of recent stream frames for pre-click GIF exports."""
 
-    FRAME_RATE = 5
+    FRAME_RATE = 3
     MAX_SECONDS = 60
+    MAX_WIDTH = 640
+    JPEG_QUALITY = 90
 
     def __init__(self, source_url):
         self.source_url = source_url
@@ -44,9 +68,9 @@ class RollingGifBuffer:
         self._stop_event.set()
 
     def recent_frames(self, duration):
-        frame_count = min(len(self.frames), max(1, round(duration * self.FRAME_RATE)))
         with self._lock:
-            frames = [frame.copy() for _, frame in list(self.frames)[-frame_count:]]
+            frame_count = min(len(self.frames), max(1, round(duration * self.FRAME_RATE)))
+            frames = [frame_data for _, frame_data in list(self.frames)[-frame_count:]]
         if not frames:
             raise RuntimeError("GIF buffer is still starting. Try again in a moment.")
         return frames
@@ -68,10 +92,12 @@ class RollingGifBuffer:
                     continue
                 next_frame_at = now + frame_interval
                 height, width = frame.shape[:2]
-                if width > 320:
-                    frame = cv2.resize(frame, (320, round(height * 320 / width)))
+                if width > self.MAX_WIDTH:
+                    frame = cv2.resize(
+                        frame, (self.MAX_WIDTH, round(height * self.MAX_WIDTH / width))
+                    )
                 encoded, image_data = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.JPEG_QUALITY]
                 )
                 if not encoded:
                     continue
@@ -84,12 +110,12 @@ class RollingGifBuffer:
                 capture.release()
 
 
-def export_gif(frame_buffer, duration, speed_up):
-    """Save the recent frame buffer as a GIF in the user's Downloads folder."""
+def export_webp(frame_buffer, duration, speed_up):
+    """Save the recent frame buffer as an animated WebP in the Downloads folder."""
     frames = [Image.open(BytesIO(frame_data)).convert("RGB") for frame_data in frame_buffer.recent_frames(duration)]
     downloads = Path.home() / "Downloads"
     downloads.mkdir(exist_ok=True)
-    output_path = downloads / f"downlink-{datetime.now():%Y%m%d-%H%M%S}.gif"
+    output_path = downloads / f"downlink-{datetime.now():%Y%m%d-%H%M%S}.webp"
     frame_duration = 100 if speed_up else 200
     frames[0].save(
         output_path,
@@ -97,9 +123,11 @@ def export_gif(frame_buffer, duration, speed_up):
         append_images=frames[1:],
         duration=frame_duration,
         loop=0,
-        optimize=False,
+        format="WEBP",
+        quality=80,
+        method=0,
     )
-    debug_log(f"GIF_EXPORT saved={output_path} duration={duration}s speed_up={speed_up} frames={len(frames)}")
+    debug_log(f"WEBP_EXPORT saved={output_path} duration={duration}s speed_up={speed_up} frames={len(frames)}")
     return output_path.name
 
 
@@ -125,7 +153,7 @@ def _youtube_page(feeds, slot_count, playback_title):
             '<div class="cell">'
             f'<iframe src="https://www.youtube.com/embed/{safe_id}?autoplay=1&amp;mute=1&amp;playsinline=1&amp;rel=0" '
             'allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>'
-            f'<aside class="feed-toolbar"><button type="button" onclick="copyCredit({index}, this)">Link</button><button type="button" onclick="createQuickGif({index}, this)">Quick</button><button type="button" onclick="openGifDialog({index})">GIF</button></aside>'
+            f'<aside class="feed-toolbar"><button type="button" onclick="copyCredit({index}, this)">Link</button></aside>'
             '</div>'
         )
     return f"""<!doctype html>
@@ -141,22 +169,8 @@ iframe {{ flex:1 1 auto; min-width:0; height:100%; border:0; display:block; back
 .cell:hover .feed-toolbar {{ width:56px; flex-basis:56px; padding:10px 5px; opacity:1; border-left-width:1px; }}
 .feed-toolbar button {{ width:100%; border:1px solid #4a525e; border-radius:4px; background:#252a31; color:#fff; cursor:pointer; font:13px sans-serif; padding:7px 4px; }}
 .feed-toolbar button:hover {{ background:#343b45; }}
-.gif-dialog {{ width:250px; border:1px solid #4a525e; border-radius:6px; padding:0; background:#20242a; color:#f4f6f8; font:13px sans-serif; }}
-.gif-dialog::backdrop {{ background:rgba(0, 0, 0, .55); }}
-.gif-form {{ display:flex; flex-direction:column; gap:14px; padding:16px; }}
-.gif-form h2 {{ margin:0; font-size:16px; font-weight:600; }}
-.gif-status {{ min-height:16px; margin:0; color:#aeb6c2; font-size:12px; }}
-.gif-form label {{ display:flex; flex-direction:column; gap:6px; }}
-.gif-form input[type="number"] {{ box-sizing:border-box; width:100%; border:1px solid #4a525e; border-radius:4px; background:#121416; color:#f4f6f8; padding:7px; }}
-.gif-form .checkbox-label {{ flex-direction:row; align-items:center; gap:8px; }}
-.gif-actions {{ display:flex; justify-content:flex-end; gap:8px; }}
-.gif-actions button {{ width:auto; padding:7px 12px; }}
-.gif-actions .primary {{ background:#2f6fbd; border-color:#4386d9; }}
-.gif-actions .primary:hover {{ background:#3a7ed1; }}
-</style></head><body><div class="video-grid">{''.join(cells)}</div><dialog class="gif-dialog" id="gif-dialog"><form class="gif-form" method="dialog" onsubmit="saveGifSettings(event)"><h2>Create GIF</h2><label>Duration (seconds)<input id="gif-duration" type="number" min="1" max="60" value="30" required></label><label class="checkbox-label"><input id="gif-speed-up" type="checkbox"> Speed up</label><p class="gif-status" id="gif-status"></p><div class="gif-actions"><button type="button" onclick="closeGifDialog()">Cancel</button><button class="primary" id="gif-create" type="submit">Create</button></div></form></dialog><script>
+</style></head><body><div class="video-grid">{''.join(cells)}</div><script>
 const feeds = {json.dumps(feeds)};
-let lastGifSettings = {{duration: 30, speed_up: false}};
-let selectedFeedIndex = 0;
 function copyCredit(feedIndex, button) {{
     const creditText = feeds[feedIndex].credit_text;
     navigator.clipboard.writeText(creditText).catch(() => {{
@@ -170,57 +184,12 @@ function copyCredit(feedIndex, button) {{
     button.textContent = 'Copied';
     setTimeout(() => button.textContent = 'Link', 1200);
 }}
-function openGifDialog(feedIndex) {{
-    selectedFeedIndex = feedIndex;
-    document.getElementById('gif-dialog').showModal();
-}}
-function closeGifDialog() {{
-    document.getElementById('gif-dialog').close();
-}}
-async function saveGifSettings(event) {{
-    event.preventDefault();
-    const duration = Number(document.getElementById('gif-duration').value);
-    const speedUp = document.getElementById('gif-speed-up').checked;
-    const createButton = document.getElementById('gif-create');
-    const status = document.getElementById('gif-status');
-        lastGifSettings = {{duration, speed_up: speedUp}};
-        await createGif(selectedFeedIndex, lastGifSettings, createButton, status);
-}}
-    async function createQuickGif(feedIndex, button) {{
-        await createGif(feedIndex, lastGifSettings, button);
-}}
-    async function createGif(feedIndex, settings, button, status = null) {{
-        const originalLabel = button.textContent;
-        button.disabled = true;
-        button.textContent = 'Wait';
-        if (status) status.textContent = 'Creating GIF from recent footage...';
-    try {{
-        const response = await fetch('/gif', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{...settings, feed_index: feedIndex}}),
-        }});
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || 'GIF export failed.');
-            if (status) status.textContent = `Saved to Downloads: ${{result.filename}}`;
-            button.textContent = 'Saved';
-    }} catch (error) {{
-            if (status) status.textContent = error.message;
-            button.textContent = 'Error';
-    }} finally {{
-            setTimeout(() => button.textContent = originalLabel, 1200);
-            button.disabled = false;
-    }}
-}}
 </script></body></html>""".encode("utf-8")
 
 
 def run_youtube_webview(feeds, slot_count, title):
     """Run one WebView containing all YouTube iframes for a playback."""
     page = _youtube_page(feeds, slot_count, title)
-    frame_buffers = [RollingGifBuffer(feed["source_url"]) for feed in feeds]
-    for frame_buffer in frame_buffers:
-        frame_buffer.start()
 
     class WrapperHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -233,31 +202,6 @@ def run_youtube_webview(feeds, slot_count, title):
         def log_message(self, _format, *_args):
             return
 
-        def do_POST(self):
-            if self.path != "/gif":
-                self.send_error(404)
-                return
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                options = json.loads(self.rfile.read(content_length))
-                duration = max(1, int(options["duration"]))
-                feed_index = int(options["feed_index"])
-                if not 0 <= feed_index < len(frame_buffers):
-                    raise ValueError("The selected feed is unavailable.")
-                filename = export_gif(
-                    frame_buffers[feed_index], duration, bool(options.get("speed_up"))
-                )
-                response, status = {"filename": filename}, 200
-            except Exception as exc:
-                debug_log(f"GIF_EXPORT failed: {exc}")
-                response, status = {"error": str(exc)}, 500
-            encoded = json.dumps(response).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
-
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), WrapperHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     webview.create_window(
@@ -267,10 +211,143 @@ def run_youtube_webview(feeds, slot_count, title):
         height=600,
         hidden=True,
     )
-    webview.start(gui="edgechromium")
-    for frame_buffer in frame_buffers:
-        frame_buffer.stop()
+    webview.start(gui="edgechromium", private_mode=False, storage_path=YOUTUBE_PROFILE_DIR)
     server.shutdown()
+
+
+def run_youtube_account(action):
+    """Manage the persistent YouTube browser session."""
+    title = f"{APP_TITLE} YouTube Account"
+
+    if action == "signin":
+        window = webview.create_window(
+            title,
+            "https://www.youtube.com/",
+            width=520,
+            height=700,
+            hidden=False,
+        )
+
+        def check_login(attempt=0):
+            try:
+                result = window.evaluate_js(r"""
+                    (() => {
+                        const avatar =
+                            document.querySelector('#avatar-btn') ||
+                            document.querySelector('ytd-topbar-menu-button-renderer#avatar-btn');
+
+                        const accountButton =
+                            document.querySelector('button[aria-label*="Account"]') ||
+                            document.querySelector('button[aria-label*="account"]');
+
+                        const signIn =
+                            document.querySelector('a[href*="accounts.google.com/ServiceLogin"]') ||
+                            document.querySelector('ytd-button-renderer a[href*="ServiceLogin"]');
+
+                        const signedIn =
+                            (!!avatar || !!accountButton) && !signIn;
+
+                        return {
+                            signed_in: signedIn,
+                            url: window.location.href,
+                            title: document.title
+                        };
+                    })()
+                """)
+
+                signed_in = (
+                    isinstance(result, dict)
+                    and result.get("signed_in") is True
+                )
+
+                debug_log(
+                    f"YOUTUBE_LOGIN_CHECK attempt={attempt} "
+                    f"signed_in={signed_in} "
+                    f"url={result.get('url') if isinstance(result, dict) else 'unknown'}"
+                )
+
+                if signed_in:
+                    _set_youtube_signed_in(True)
+                    debug_log("YOUTUBE_SIGNIN_DETECTED")
+                    return
+
+                # Give YouTube more time to finish rendering/login redirects.
+                if attempt < 20:
+                    window.evaluate_js(
+                        "setTimeout(() => {}, 100)"
+                    )
+                    threading.Timer(
+                        0.75,
+                        lambda: check_login(attempt + 1)
+                    ).start()
+                    return
+
+                # Do not overwrite an already-known signed-in session
+                # just because the final DOM check was inconclusive.
+                debug_log("YOUTUBE_SIGNIN_NOT_CONFIRMED")
+
+            except Exception as exc:
+                debug_log(
+                    f"YOUTUBE_SIGNIN_CHECK_FAILED "
+                    f"attempt={attempt} error={exc!r}"
+                )
+
+                if attempt < 20:
+                    threading.Timer(
+                        0.75,
+                        lambda: check_login(attempt + 1)
+                    ).start()
+
+        def on_loaded(_window=None):
+            threading.Timer(
+                2.0,
+                lambda: check_login(0)
+            ).start()
+
+        def on_closed():
+            # The page may have just finished a Google → YouTube redirect.
+            # Give the browser a moment before the final check.
+            threading.Timer(
+                0.5,
+                lambda: check_login(0)
+            ).start()
+
+        window.events.loaded += on_loaded
+        window.events.closed += on_closed
+
+        webview.start(
+            gui="edgechromium",
+            private_mode=False,
+            storage_path=YOUTUBE_PROFILE_DIR,
+        )
+        return
+
+    if action == "signout":
+        _set_youtube_signed_in(False)
+
+        window = webview.create_window(
+            title,
+            "https://www.youtube.com/",
+            width=520,
+            height=700,
+            hidden=True,
+        )
+
+        def clear_session():
+            try:
+                window.clear_cookies()
+                _set_youtube_signed_in(False)
+                window.destroy()
+            except Exception as exc:
+                debug_log(f"YOUTUBE_SIGNOUT_FAILED error={exc!r}")
+
+        webview.start(
+            clear_session,
+            gui="edgechromium",
+            private_mode=False,
+            storage_path=YOUTUBE_PROFILE_DIR,
+        )
+        return
 
 
 class YouTubeBrowser(ctk.CTkFrame):

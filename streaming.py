@@ -1,9 +1,10 @@
 """Stream URL classification and resolution."""
 
+import os
 import re
 from urllib.parse import urlparse
 
-from app_support import debug_log
+from app_support import YOUTUBE_COOKIES_FILE, debug_log
 
 import yt_dlp
 
@@ -79,6 +80,8 @@ def resolve_stream(url: str):
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": True,
     }
+    if is_youtube_url(url) and os.path.isfile(YOUTUBE_COOKIES_FILE):
+        ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

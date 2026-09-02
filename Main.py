@@ -15,8 +15,15 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import vlc
 
-from app_support import APP_TITLE, FEEDS_FILE, ICON_FILE, debug_log
+from app_support import (
+    APP_TITLE,
+    FEEDS_FILE,
+    ICON_FILE,
+    debug_log,
+)
 from streaming import is_youtube_url, redact_url, resolve_stream, youtube_video_id
+from youtube_player import YouTubeBrowser, run_youtube_account, youtube_signed_in
+from youtube_player import RollingGifBuffer, export_webp
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -25,9 +32,10 @@ ctk.set_default_color_theme("blue")
 class StreamPane(ctk.CTkFrame):
     """One independently playable stream inside a window."""
 
-    def __init__(self, master, stream_url: str, title: str, headers=None, original_url: str = "", instance=None):
+    def __init__(self, master, stream_url: str, title: str, headers=None, original_url: str = "", instance=None, box_number=None):
         super().__init__(master, fg_color="#080808", corner_radius=6)
         debug_log(f"[{title}] STREAM_START original={redact_url(original_url or stream_url)}")
+        self.box_number = box_number
         self.stream_title = title
         self.original_url = original_url or stream_url
         self.headers = headers or {}
@@ -53,10 +61,9 @@ class StreamPane(ctk.CTkFrame):
         self.hover_toolbar = ctk.CTkFrame(
             self, fg_color="#252a31", corner_radius=4, border_width=1, border_color="#4a525e"
         )
-        ctk.CTkButton(
-            self.hover_toolbar, text="Test", width=58, height=26,
-            command=self._test_option
-        ).pack(padx=5, pady=5)
+        ctk.CTkButton(self.hover_toolbar, text="Link", width=58, height=26, command=self.copy_source_link).pack(padx=5, pady=(5, 2))
+        ctk.CTkButton(self.hover_toolbar, text="Quick", width=58, height=26, command=self.create_quick_webp).pack(padx=5, pady=2)
+        ctk.CTkButton(self.hover_toolbar, text="WebP", width=58, height=26, command=self.open_webp_options).pack(padx=5, pady=(2, 5))
         self._bind_hover_events(self)
 
         vlc_args = [
@@ -75,6 +82,8 @@ class StreamPane(ctk.CTkFrame):
 
         self.player = self.instance.media_player_new()
         self._set_media(stream_url, self.headers)
+        self.gif_buffer = RollingGifBuffer(self.original_url)
+        self.gif_buffer.start()
 
         self.player.audio_set_volume(80)
         self._last_position = None
@@ -119,8 +128,32 @@ class StreamPane(ctk.CTkFrame):
         if not inside_pane:
             self.hover_toolbar.place_forget()
 
-    def _test_option(self):
-        debug_log(f"[{self.stream_title}] HOVER_TOOLBAR_TEST")
+    def copy_source_link(self):
+        credit_text = f"[ Credit: [{self.stream_title}](<{self.original_url}>) ]"
+        window = self.winfo_toplevel()
+        window.clipboard_clear()
+        window.clipboard_append(credit_text)
+        window.update()
+
+    def create_quick_webp(self):
+        self._create_webp(30, False)
+
+    def open_webp_options(self):
+        WebpOptionsDialog(self, self._create_webp)
+
+    def _create_webp(self, duration, speed_up):
+        threading.Thread(
+            target=self._export_webp,
+            args=(duration, speed_up),
+            daemon=True,
+        ).start()
+
+    def _export_webp(self, duration, speed_up):
+        try:
+            filename = export_webp(self.gif_buffer, duration, speed_up)
+            debug_log(f"[{self.stream_title}] WEBP_SAVED file={filename}")
+        except Exception as exc:
+            debug_log(f"[{self.stream_title}] WEBP_EXPORT_FAILED error={exc!r}")
 
     def _set_media(self, stream_url: str, headers: dict):
         """Creates and configures a new media object with stream options."""
@@ -310,11 +343,44 @@ class StreamPane(ctk.CTkFrame):
     def stop(self):
         debug_log(f"[{self.stream_title}] STOP runtime={time.monotonic() - self._started_at:.1f}s")
         self._stopped = True
+        self.gif_buffer.stop()
         self.player.stop()
         media = self.player.get_media()
         if media:
             media.release()
         self.destroy()
+
+
+class WebpOptionsDialog(ctk.CTkToplevel):
+    """Native animated WebP settings dialog for an individual stream."""
+
+    def __init__(self, master, on_create):
+        super().__init__(master)
+        self.title("Create WebP")
+        self.geometry("300x180")
+        self.resizable(False, False)
+        self.transient(master.winfo_toplevel())
+        self.grab_set()
+        self.on_create = on_create
+        self.speed_up = tk.BooleanVar(value=False)
+
+        ctk.CTkLabel(self, text="Create WebP", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=20, pady=(18, 10))
+        ctk.CTkLabel(self, text="Duration (seconds)").pack(anchor="w", padx=20)
+        self.duration_entry = ctk.CTkEntry(self)
+        self.duration_entry.insert(0, "30")
+        self.duration_entry.pack(fill="x", padx=20, pady=(4, 8))
+        ctk.CTkCheckBox(self, text="Speed up", variable=self.speed_up).pack(anchor="w", padx=20)
+        ctk.CTkButton(self, text="Create", command=self.create).pack(side="right", padx=20, pady=14)
+
+    def create(self):
+        try:
+            duration = max(1, min(60, int(self.duration_entry.get())))
+        except ValueError:
+            messagebox.showerror("Invalid duration", "Enter a whole number from 1 to 60.", parent=self)
+            return
+        self.grab_release()
+        self.destroy()
+        self.on_create(duration, self.speed_up.get())
 
 
 class PlayerWindow(ctk.CTkToplevel):
@@ -335,8 +401,11 @@ class PlayerWindow(ctk.CTkToplevel):
         self.bind("<FocusIn>", lambda _event: master.set_active_window(self))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def add_stream(self, stream_url, title, headers=None, original_url=""):
-        pane = StreamPane(self.grid_frame, stream_url, title, headers, original_url, self.vlc_instance)
+    def add_stream(self, stream_url, title, headers=None, original_url="", slot_index=None):
+        box_number = (slot_index + 1) if slot_index is not None else None
+        pane = StreamPane(
+            self.grid_frame, stream_url, title, headers, original_url, self.vlc_instance, box_number=box_number
+        )
         self.panes.append(pane)
         self._configure_layout()
 
@@ -345,33 +414,64 @@ class PlayerWindow(ctk.CTkToplevel):
         self.panes.append(pane)
         self._configure_layout()
 
+    def add_youtube_feeds(self, feed_slots, slot_count, generation=None):
+        if generation is not None and getattr(self, "_open_generation", None) != generation:
+            return
+        yt_pane = YouTubeBrowser(self.grid_frame, feed_slots, slot_count, self.title())
+        self.panes.append(yt_pane)
+        self._configure_layout()
+
+    def set_layout_size_count(self, feed_count):
+        self._layout_size_count = max(1, feed_count)
+
     def _configure_layout(self):
         self.grid_frame.update_idletasks()
         pane_count = len(self.panes)
         if pane_count == 0:
             return
 
-        columns, rows = self._grid_dimensions(pane_count)
-
-        # Forget old placements
-        for item in self.panes:
-            item.place_forget()
-
+        # Use the TRUE total slot count (not len(self.panes)) for the grid
+        # math -- the combined YouTube pane is a single widget in self.panes
+        # but visually represents several slots at once, so basing the grid
+        # on len(self.panes) undercounts how many cells the window actually
+        # needs and throws off every other pane's proportions.
+        total_slots = max(self._layout_size_count, pane_count)
+        columns, rows = self._grid_dimensions(total_slots)
         cell_width = 1.0 / columns
         cell_height = 1.0 / rows
 
-        for index, item in enumerate(self.panes):
+        for item in self.panes:
+            item.place_forget()
+
+        # The combined YouTube pane (if present) already lays its own feeds
+        # out internally using this same slot_count/grid math, so it should
+        # span the WHOLE grid area rather than being squeezed into "1 of N
+        # panes". Every other real pane (a VLC stream or an empty-slot
+        # placeholder) is then placed on top of it at its own true slot
+        # position, covering whatever the combined pane renders underneath
+        # at that particular cell.
+        youtube_pane = next((item for item in self.panes if isinstance(item, YouTubeBrowser)), None)
+        other_panes = [item for item in self.panes if item is not youtube_pane]
+
+        if youtube_pane is not None:
+            youtube_pane.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+
+        for item in other_panes:
+            box_number = getattr(item, "box_number", None)
+            if box_number is None:
+                continue
+            index = box_number - 1
             row = index // columns
             col = index % columns
-
             item.place(
                 relx=col * cell_width,
                 rely=row * cell_height,
                 relwidth=cell_width,
                 relheight=cell_height,
             )
+            item.lift()
 
-        self.resize_for_count(pane_count)
+        self.resize_for_count(total_slots)
 
     def _grid_dimensions(self, pane_count):
         if pane_count <= 1:
@@ -559,7 +659,11 @@ class LoadingPopup(tk.Toplevel):
         self.update_idletasks()
         self.update()
         self.lift()
-        self.focus_force()
+
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
 
         try:
             self.grab_set()
@@ -639,7 +743,8 @@ class PlaceholderPane(ctk.CTkFrame):
 
     def __init__(self, master, window_title: str, box_number: int):
         super().__init__(master, fg_color="#080808", corner_radius=6)
-        
+        self.box_number = box_number
+
         container = ctk.CTkFrame(self, fg_color="#121212", corner_radius=4)
         container.pack(fill="both", expand=True, padx=2, pady=2)
 
@@ -890,6 +995,7 @@ class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} Hub")
+        self.youtube_signed_in = youtube_signed_in()
         self.iconbitmap(ICON_FILE)
         self.geometry("1180x760")
         self.minsize(900, 600)
@@ -919,6 +1025,100 @@ class MainWindow(ctk.CTk):
         self.render_feeds()
         self.render_playbacks()
 
+    def toggle_youtube_account(self):
+        if self.youtube_signed_in:
+            self.sign_out_youtube()
+        else:
+            self.sign_in_youtube()
+
+    def sign_in_youtube(self):
+        self.youtube_account_button.configure(
+            text="Signing in...",
+            state="disabled",
+        )
+        self.status.configure(
+            text="Sign in to YouTube in the window that opened."
+        )
+
+        self._youtube_account_process = multiprocessing.Process(
+            target=run_youtube_account,
+            args=("signin",),
+            daemon=True,
+        )
+        self._youtube_account_process.start()
+        self._poll_youtube_account("signin")
+
+    def sign_out_youtube(self):
+        self.youtube_signed_in = False
+        self.youtube_account_button.configure(
+            text="Signing out...",
+            state="disabled",
+        )
+        self.status.configure(text="Signing out of YouTube...")
+
+        self._youtube_account_process = multiprocessing.Process(
+            target=run_youtube_account,
+            args=("signout",),
+            daemon=True,
+        )
+        self._youtube_account_process.start()
+        self._poll_youtube_account("signout")
+
+    def _poll_youtube_account(self, action):
+        signed_in = youtube_signed_in()
+        process = getattr(self, "_youtube_account_process", None)
+
+        if action == "signin" and signed_in:
+            self.youtube_signed_in = True
+            self.youtube_account_button.configure(
+                text="Sign out",
+                state="normal",
+            )
+            self.status.configure(text="YouTube account signed in.")
+            return
+
+        if action == "signout" and not signed_in:
+            self.youtube_signed_in = False
+            self.youtube_account_button.configure(
+                text="Sign in",
+                state="normal",
+            )
+            self.status.configure(text="YouTube account signed out.")
+            return
+
+        if process is not None and process.is_alive():
+            self.after(500, lambda: self._poll_youtube_account(action))
+            return
+
+        # The browser process closed without reaching the expected state.
+        # Re-read the state one last time, then restore the appropriate button.
+        self.youtube_signed_in = youtube_signed_in()
+        self.youtube_account_button.configure(
+            text="Sign out" if self.youtube_signed_in else "Sign in",
+            state="normal",
+        )
+
+        if action == "signin":
+            self.status.configure(
+                text="YouTube sign-in was not detected."
+                if not self.youtube_signed_in
+                else "YouTube account signed in."
+            )
+        else:
+            self.status.configure(
+                text="YouTube account signed out."
+                if not self.youtube_signed_in
+                else "YouTube sign-out was not completed."
+            )
+
+    def _refresh_youtube_button(self):
+        """Refresh the header button from the persistent session state."""
+        self.youtube_signed_in = youtube_signed_in()
+        self.youtube_account_button.configure(
+            text="Sign out" if self.youtube_signed_in else "Sign in",
+            state="normal",
+        )
+
     def _build_ui(self):
         self.configure(fg_color="#202329")
 
@@ -934,6 +1134,20 @@ class MainWindow(ctk.CTk):
             command=self.show_add_playback_menu
         )
         self.add_playback_button.pack(side="right", padx=8, pady=7)
+        self.youtube_account_button = ctk.CTkButton(
+            top,
+            text="Sign out" if self.youtube_signed_in else "Sign in",
+            width=75,
+            height=28,
+            fg_color="#2f8cff",
+            hover_color="#1f6fc9",
+            command=self.toggle_youtube_account,
+        )
+        self.youtube_account_button.pack(
+            side="right",
+            padx=(0, 4),
+            pady=7,
+        )
         ctk.CTkButton(
             top, text="+ Feed", width=80, height=28,
             command=self.add_feed
@@ -1484,7 +1698,12 @@ class MainWindow(ctk.CTk):
             if feed_name else None
             for feed_name in slots
         ]
+        youtube_feeds = [
+            (index, feed) for index, feed in enumerate(slot_feeds)
+            if feed and is_youtube_url(feed.get("url", ""))
+        ]
 
+        window.set_layout_size_count(len(slots))
         window.resize_for_count(len(slots))
 
         assigned_feeds = [
@@ -1515,11 +1734,18 @@ class MainWindow(ctk.CTk):
                 window.add_placeholder(box_number)
                 continue
 
-            threading.Thread(
-                target=self.resolve_and_add,
-                args=(feed, window, generation, loading_popup),
-                daemon=True,
-            ).start()
+            if is_youtube_url(feed.get("url", "")):
+                if loading_popup is not None:
+                    loading_popup.mark_done()
+            else:
+                threading.Thread(
+                    target=self.resolve_and_add,
+                    args=(feed, window, generation, loading_popup, index),
+                    daemon=True,
+                ).start()
+
+        if youtube_feeds:
+            window.add_youtube_feeds(youtube_feeds, len(slots), generation=generation)
 
     def show_playback_window(self, window):
         if window is None or not window.winfo_exists():
@@ -1544,7 +1770,7 @@ class MainWindow(ctk.CTk):
         if window.winfo_exists():
             self.active_window = window
 
-    def resolve_and_add(self, feed, window, generation, loading_popup=None):
+    def resolve_and_add(self, feed, window, generation, loading_popup=None, slot_index=None):
         try:
             debug_log(f"[{feed['name']}] RESOLVE_FEED starting original={redact_url(feed['url'])}")
             stream_url, thumbnail, headers = resolve_stream(feed["url"])
@@ -1559,7 +1785,7 @@ class MainWindow(ctk.CTk):
                 self.after(0, self.render_playbacks)
 
             self.after(0, lambda: self._add_resolved_stream(
-                window, generation, stream_url, feed["name"], headers, feed["url"]
+                window, generation, stream_url, feed["name"], headers, feed["url"], slot_index
             ))
         except Exception as exc:
             debug_log(f"[{feed['name']}] RESOLVE_FEED failed error={exc!r}")
@@ -1582,9 +1808,9 @@ class MainWindow(ctk.CTk):
             and any(current is window for current in self.windows.values())
         )
 
-    def _add_resolved_stream(self, window, generation, stream_url, title, headers, original_url):
+    def _add_resolved_stream(self, window, generation, stream_url, title, headers, original_url, slot_index=None):
         if self._is_current_playback(window, generation):
-            window.add_stream(stream_url, title, headers=headers, original_url=original_url)
+            window.add_stream(stream_url, title, headers=headers, original_url=original_url, slot_index=slot_index)
 
 
 class ThemedForm(ctk.CTkToplevel):
